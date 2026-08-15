@@ -1,0 +1,5 @@
+node_modules/
+chrome-profile/
+accounts.json
+debug-before-signup.png
+debug-after-signup.png
