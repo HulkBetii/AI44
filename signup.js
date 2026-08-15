@@ -3,15 +3,33 @@ const fs = require('fs');
 const path = require('path');
 
 const ACCOUNTS_FILE = path.join(__dirname, 'accounts.json');
+const FAILURE_SCREENSHOT = path.join(__dirname, 'debug-failure.png');
 
-function saveAccount(email, password, apiKey) {
+const SIGNUP_TIMEOUT_MS = 300000;
+const INBOX_TIMEOUT_MS = 120000;
+
+// Tracked at module scope so the failure handler can screenshot the page that broke
+// and still persist whatever credentials were already created.
+let context = null;
+let activePage = null;
+let currentStep = 'init';
+let account = null;
+
+function step(name) {
+  currentStep = name;
+  console.log(`[step] ${name}`);
+}
+
+function saveAccount(record) {
   const accounts = fs.existsSync(ACCOUNTS_FILE)
     ? JSON.parse(fs.readFileSync(ACCOUNTS_FILE, 'utf8'))
     : [];
-  const id = accounts.length + 1;
-  accounts.push({ id, email, password, apiKey, createdAt: new Date().toISOString() });
+  // Derive from max id, not length: deleting a middle entry would otherwise collide.
+  const id = accounts.reduce((max, a) => Math.max(max, a.id ?? 0), 0) + 1;
+  accounts.push({ id, ...record, createdAt: new Date().toISOString() });
   fs.writeFileSync(ACCOUNTS_FILE, JSON.stringify(accounts, null, 2));
   console.log(`[✓] Account #${id} saved to accounts.json`);
+  return id;
 }
 
 // ── mail.tm REST API ────────────────────────────────────────────────────────
@@ -57,20 +75,21 @@ async function pollMailTmInbox(token, timeoutMs = 120000) {
     const json = await res.json();
     const messages = json['hydra:member'];
 
-    if (messages && messages.length > 0) {
-      // Get full message to find verify link
-      const msgRes = await fetch(`${base}/messages/${messages[0].id}`, {
+    // Scan every message, not just the newest: any unrelated mail arriving first would
+    // otherwise mask the verification mail until the timeout expires.
+    for (const { id } of messages ?? []) {
+      const msgRes = await fetch(`${base}/messages/${id}`, {
         headers: { Authorization: `Bearer ${token}` },
       });
       const msg = await msgRes.json();
-      const body = msg.html?.[0] || msg.text || '';
+      const body = [...(msg.html ?? []), msg.text ?? ''].join(' ');
 
       // Extract ElevenLabs verify URL
       const match = body.match(/href="(https:\/\/elevenlabs\.io\/app\/action[^"]+)"/);
       if (match) return match[1].replace(/&amp;/g, '&');
     }
 
-    console.log('[3] No email yet, waiting 5s...');
+    console.log('[5] No email yet, waiting 5s...');
     await new Promise(r => setTimeout(r, 5000));
   }
   throw new Error('Timeout: no verification email received');
@@ -87,16 +106,22 @@ function generatePassword() {
 // Human-like typing
 async function typeHuman(page, selector, text) {
   await page.click(selector);
+  // Clear first: browser autofill can pre-populate the field, which would corrupt the value.
+  await page.fill(selector, '');
   for (const char of text) {
     await page.keyboard.type(char, { delay: 50 + Math.random() * 80 });
   }
 }
 
-(async () => {
+async function run() {
   // ── STEP 1: Create mail.tm account ─────────────────────────────────────────
-  console.log('[1] Creating mail.tm account...');
-  const { address: email, token: mailToken } = await createMailTmAccount();
+  step('1/10 create mail.tm account');
+  const { address: email, password: mailboxPassword, token: mailToken } = await createMailTmAccount();
   const password = generatePassword();
+
+  // Registered early so a mid-run failure still persists the usable credentials.
+  account = { email, password, mailboxPassword, mailboxToken: mailToken, apiKey: null };
+
   console.log(`✅ Email: ${email}`);
   console.log(`✅ Password: ${password}`);
 
@@ -104,7 +129,8 @@ async function typeHuman(page, selector, text) {
   const CHROME_EXE = 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe';
   const PROFILE_DIR = 'D:\\VibeCoding\\mail-temp\\chrome-profile';
 
-  const context = await chromium.launchPersistentContext(PROFILE_DIR, {
+  step('2/10 launch chrome');
+  context = await chromium.launchPersistentContext(PROFILE_DIR, {
     headless: false,
     executablePath: CHROME_EXE,
     args: [
@@ -112,9 +138,13 @@ async function typeHuman(page, selector, text) {
       '--no-sandbox',
       '--disable-infobars',
       '--profile-directory=Default',
+      // Earlier crashed runs left the profile dirty; this suppresses the leftover prompt.
+      '--hide-crash-restore-bubble',
     ],
     ignoreDefaultArgs: ['--enable-automation'],
     slowMo: 50,
+    // navigator.clipboard.readText() throws without this (used to read the generated API key).
+    permissions: ['clipboard-read', 'clipboard-write'],
   });
   // Hide webdriver flag
   await context.addInitScript(() => {
@@ -122,21 +152,24 @@ async function typeHuman(page, selector, text) {
   });
 
   // ── STEP 3: Sign up on ElevenLabs ──────────────────────────────────────────
-  console.log('[2] Opening ElevenLabs sign-up...');
+  step('3/10 open sign-up page');
   const page = await context.newPage();
+  activePage = page;
 
   // Clear all ElevenLabs cookies + storage to avoid existing session interference
   await context.clearCookies({ domain: 'elevenlabs.io' });
-  console.log('[2] Cleared ElevenLabs cookies.');
+  console.log('[3] Cleared ElevenLabs cookies.');
 
   await page.goto('https://elevenlabs.io', { waitUntil: 'domcontentloaded' });
   await page.evaluate(() => {
     localStorage.clear();
     sessionStorage.clear();
   });
-  console.log('[2] Cleared ElevenLabs localStorage/sessionStorage.');
+  console.log('[3] Cleared ElevenLabs localStorage/sessionStorage.');
 
-  await page.goto('https://elevenlabs.io/app/sign-up', { waitUntil: 'networkidle' });
+  // Not 'networkidle': the site keeps analytics/websocket traffic alive, so it never settles.
+  // The waitForSelector below is the real readiness signal.
+  await page.goto('https://elevenlabs.io/app/sign-up', { waitUntil: 'domcontentloaded' });
   await page.waitForSelector('[data-testid="sign-up-email-input"]', { timeout: 15000 });
 
   // Human-like delay before typing
@@ -146,55 +179,51 @@ async function typeHuman(page, selector, text) {
   await typeHuman(page, '[data-testid="sign-up-password-input"]', password);
   await page.waitForTimeout(600 + Math.random() * 400);
 
-  console.log('[2] Clicking Sign up...');
+  console.log('[3] Clicking Sign up...');
   await page.click('button[style*="view-transition-name: submit"]');
 
   // ── STEP 4: Handle CAPTCHA if present ──────────────────────────────────────
-  // Wait up to 60s for either: CAPTCHA disappears OR URL changes
-  console.log('[2] Waiting for CAPTCHA to be solved or page to change...');
-  try {
-    await page.waitForFunction(
-      () => !document.querySelector('[class*="captcha"], iframe[src*="captcha"]') || 
-             window.location.href !== 'https://elevenlabs.io/app/sign-up',
-      { timeout: 120000 }
-    );
-  } catch {
-    // Try anyway
-  }
+  step('4/10 wait for signup to clear (CAPTCHA may need manual solving)');
+  console.log(`[4] URL after submit: ${page.url()}`);
 
-  const urlAfter = page.url();
-  console.log(`[2] URL after signup: ${urlAfter}`);
-
-  // If still on signup page, CAPTCHA may need solving - wait for user
+  // Still on the signup page means the submit has not gone through yet.
   if (page.url().includes('sign-up')) {
-    console.log('\n⚠️  CAPTCHA detected. Please solve it in the browser window.');
-    // Wait for either: URL changes OR "Resend" button appears (= verification email sent)
-    await Promise.race([
-      page.waitForURL(url => !url.toString().includes('/sign-up'), { timeout: 300000 }),
-      page.waitForSelector('button:has-text("Resend")', { timeout: 300000 }),
+    console.log('\n⚠️  Solve the CAPTCHA in the browser window if one is shown.');
+    // Either the URL leaves /sign-up, or a "Resend" button appears (= verification email sent).
+    // Both branches swallow their own timeout so the losing promise cannot reject unhandled
+    // after the race has already settled.
+    const settled = await Promise.race([
+      page.waitForURL(url => !url.toString().includes('/sign-up'), { timeout: SIGNUP_TIMEOUT_MS })
+        .then(() => 'url-changed').catch(() => null),
+      page.waitForSelector('button:has-text("Resend")', { timeout: SIGNUP_TIMEOUT_MS })
+        .then(() => 'resend-shown').catch(() => null),
     ]);
-    console.log('[2] Signup complete! URL:', page.url());
+    if (!settled) {
+      throw new Error(`Signup did not complete within ${SIGNUP_TIMEOUT_MS}ms (still at ${page.url()})`);
+    }
+    console.log(`[4] Signup complete (${settled}). URL: ${page.url()}`);
   }
 
   // ── STEP 5: Poll mail.tm for verify email ──────────────────────────────────
-  console.log('[3] Polling mail.tm for verification email...');
-  const verifyUrl = await pollMailTmInbox(mailToken, 120000);
-  console.log('[3] Verify URL found:', verifyUrl.substring(0, 80) + '...');
+  step('5/10 poll mail.tm for verification email');
+  const verifyUrl = await pollMailTmInbox(mailToken, INBOX_TIMEOUT_MS);
+  console.log('[5] Verify URL found:', verifyUrl.substring(0, 80) + '...');
 
   // ── STEP 6: Open verify URL ─────────────────────────────────────────────────
-  console.log('[4] Opening verify URL...');
+  step('6/10 open verify URL');
   const verifyPage = await context.newPage();
+  activePage = verifyPage;
   await verifyPage.goto(verifyUrl, { waitUntil: 'domcontentloaded' });
   console.log(`[4] URL: ${verifyPage.url()}`);
 
   // ── STEP 7: Click Continue ──────────────────────────────────────────────────
-  console.log('[5] Clicking Continue...');
+  step('7/10 click Continue');
   await verifyPage.waitForSelector('button:has-text("Continue")', { timeout: 15000 });
   await verifyPage.click('button:has-text("Continue")');
   await verifyPage.waitForTimeout(2000);
 
   // ── STEP 8: Sign in ─────────────────────────────────────────────────────────
-  console.log('[6] Signing in...');
+  step('8/10 sign in');
   await verifyPage.waitForSelector('[data-testid="sign-in-email-input"]', { timeout: 15000 });
   await typeHuman(verifyPage, '[data-testid="sign-in-email-input"]', email);
   await verifyPage.waitForTimeout(300);
@@ -204,7 +233,7 @@ async function typeHuman(page, selector, text) {
   await verifyPage.waitForTimeout(5000);
 
   // ── STEP 9: Onboarding ──────────────────────────────────────────────────────
-  console.log('[7] Onboarding...');
+  step('9/10 onboarding');
   const firstName = ['Alex', 'Jordan', 'Taylor', 'Morgan', 'Casey', 'Riley'][Math.floor(Math.random() * 6)];
 
   // Click first "Continue" (post-verify landing)
@@ -232,8 +261,8 @@ async function typeHuman(page, selector, text) {
   }
 
   // ── STEP 10: Create API key ─────────────────────────────────────────────────
-  console.log('[8] Creating API key...');
-  await verifyPage.goto('https://elevenlabs.io/app/developers/api-keys', { waitUntil: 'networkidle' });
+  step('10/10 create API key');
+  await verifyPage.goto('https://elevenlabs.io/app/developers/api-keys', { waitUntil: 'domcontentloaded' });
   await verifyPage.waitForTimeout(2000);
 
   // Dismiss "Platform switch has moved" → "Got it"
@@ -258,23 +287,91 @@ async function typeHuman(page, selector, text) {
   await verifyPage.fill('input[placeholder="API Key Name"]', keyName);
   await verifyPage.waitForTimeout(500);
 
-  // Click "Create Key" in dialog (the protected one)
-  await verifyPage.click('[data-agent-protected="true"]:has-text("Create Key")');
-  await verifyPage.waitForTimeout(2000);
+  // Submit the "Create API Key" dialog. Its button shares the "Create Key" label with the
+  // page-level one, so scope by dialog: the button's only id is React's generated
+  // data-agent-id, which changes on every render.
+  console.log('[10] Submitting Create API Key dialog...');
+  await verifyPage
+    .getByRole('dialog')
+    .getByRole('button', { name: 'Create Key', exact: true })
+    .last()
+    .click({ timeout: 10000 });
+  await verifyPage.waitForTimeout(1000);
+
+  // A second "No Permissions Selected" dialog appears when the key was left with no endpoint
+  // access. It is conditional, so treat its absence as normal rather than an error.
+  const confirmCreate = verifyPage.locator('button[data-agent-protected="true"]', {
+    hasText: 'Create Key',
+  });
+  if (await confirmCreate.count() > 0) {
+    console.log('[10] Confirming "No Permissions Selected"...');
+    await confirmCreate.last().click({ timeout: 10000 });
+    await verifyPage.waitForTimeout(1500);
+  }
 
   // Click "Copy to Clipboard"
-  await verifyPage.waitForSelector('button:has-text("Copy to Clipboard")', { timeout: 10000 });
-  await verifyPage.click('button:has-text("Copy to Clipboard")');
+  const keyDialog = verifyPage.getByRole('dialog');
+  await verifyPage
+    .getByRole('button', { name: 'Copy to Clipboard', exact: true })
+    .click({ timeout: 15000 });
   await verifyPage.waitForTimeout(500);
 
-  // Read clipboard
-  const apiKey = await verifyPage.evaluate(() => navigator.clipboard.readText());
-  console.log(`[8] API Key: ${apiKey}`);
+  // The dialog renders the key in a readonly input. Read it there rather than from the
+  // clipboard: no permission grant or window focus required, so it cannot silently fail.
+  let apiKey = await keyDialog.locator('input[readonly]').first().inputValue().catch(() => '');
+  if (!apiKey) {
+    await verifyPage.bringToFront();
+    apiKey = await verifyPage.evaluate(() => navigator.clipboard.readText()).catch(() => '');
+  }
+  if (!apiKey.startsWith('sk_')) {
+    throw new Error(`API key not captured (got: ${JSON.stringify(apiKey)})`);
+  }
+  console.log(`[10] API Key: ${apiKey}`);
 
   console.log(`\n✅ Done!`);
   console.log(`   Email: ${email}`);
   console.log(`   Password: ${password}`);
   console.log(`   API Key: ${apiKey}`);
 
-  saveAccount(email, password, apiKey);
-})();
+  account = { ...account, apiKey, apiKeyName: keyName, firstName, status: 'complete' };
+  saveAccount(account);
+  account = null; // Persisted; stop the failure handler from writing a duplicate.
+}
+
+async function captureFailure(err) {
+  console.error(`\n❌ FAILED at step: ${currentStep}`);
+  console.error(err.stack || err.message);
+
+  // The mailbox and ElevenLabs account already exist at this point, so persist them even
+  // though the run failed. Losing them means the CAPTCHA was solved for nothing.
+  if (account) {
+    saveAccount({ ...account, status: 'incomplete', failedAt: currentStep });
+  }
+
+  if (!activePage || activePage.isClosed()) {
+    console.error('[debug] No live page to inspect.');
+    return;
+  }
+  // Page state at the moment of failure is the only thing that explains a selector timeout.
+  try {
+    console.error(`[debug] URL: ${activePage.url()}`);
+    const text = await activePage.evaluate(() => document.body.innerText.slice(0, 800));
+    console.error(`[debug] Visible text:\n${text}`);
+    await activePage.screenshot({ path: FAILURE_SCREENSHOT, fullPage: true });
+    console.error(`[debug] Screenshot: ${FAILURE_SCREENSHOT}`);
+  } catch (captureErr) {
+    console.error(`[debug] Capture failed: ${captureErr.message}`);
+  }
+}
+
+run()
+  .catch(async (err) => {
+    await captureFailure(err);
+    process.exitCode = 1;
+  })
+  .finally(async () => {
+    // Always release the persistent profile, otherwise the next run hits a profile lock.
+    if (context) {
+      await context.close().catch((err) => console.error(`[cleanup] ${err.message}`));
+    }
+  });
