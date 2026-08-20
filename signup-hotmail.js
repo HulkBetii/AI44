@@ -1,89 +1,19 @@
 const { chromium } = require('playwright');
-const { google } = require('googleapis');
 const path = require('path');
+const {
+  initSheets, loadPendingRows, updateStatus, updatePassword, updateResult,
+} = require('./sheets');
 
 const FAILURE_SCREENSHOT = path.join(__dirname, 'debug-failure.png');
 
-// ── Google Sheets config ──────────────────────────────────────────────────────
-const SHEET_ID = '1nNAzzC34zSvX2S_AJ4jB6njhKnKRWs8KeZ0mJ5oSkTU';
-const SHEET_NAME = 'hotmail';
-// Columns (1-indexed): A=email B=password C=msaToken D=tenantGuid E=recoveryEmail
-//                      F=elevenLabsApiKey G=elevenLabsPassword H=status
-const COL = { email:0, password:1, msaToken:2, tenantGuid:3, recoveryEmail:4,
-              apiKey:5, elevenPass:6, status:7 };
-
-let sheetsClient = null;
-
-async function initSheets() {
-  const key = require('./service-account.json');
-  const auth = new google.auth.GoogleAuth({
-    credentials: key,
-    scopes: ['https://www.googleapis.com/auth/spreadsheets'],
-  });
-  sheetsClient = google.sheets({ version: 'v4', auth });
-}
-
-// Returns array of { rowIndex (1-based, header=1), email, password, ... }
-async function loadPendingRows() {
-  const res = await sheetsClient.spreadsheets.values.get({
-    spreadsheetId: SHEET_ID,
-    range: `${SHEET_NAME}!A:H`,
-  });
-  const rows = res.data.values || [];
-  const pending = [];
-  for (let i = 1; i < rows.length; i++) {  // skip header row (i=0)
-    const r = rows[i];
-    const status = (r[COL.status] || '').trim().toLowerCase();
-    if (status !== 'pending') continue;
-    pending.push({
-      rowIndex: i + 1,  // Sheet rows are 1-based, header at row 1
-      email: r[COL.email] || '',
-      password: r[COL.password] || '',
-      msaToken: r[COL.msaToken] || '',
-      tenantGuid: r[COL.tenantGuid] || '',
-      recoveryEmail: r[COL.recoveryEmail] || '',
-    });
-  }
-  return pending;
-}
-
-// Writes apiKey, elevenPass, status back to the row in Sheet
-async function updateSheetRow(rowIndex, apiKey, elevenPass, status) {
-  await sheetsClient.spreadsheets.values.update({
-    spreadsheetId: SHEET_ID,
-    range: `${SHEET_NAME}!F${rowIndex}:H${rowIndex}`,
-    valueInputOption: 'RAW',
-    requestBody: { values: [[apiKey, elevenPass, status]] },
-  });
-  console.log(`[sheet] Row ${rowIndex} updated → status: ${status}`);
-}
-
-const MS_OAUTH_URL =
-  'https://login.microsoftonline.com/organizations/oauth2/v2.0/authorize' +
-  '?client_id=9199bf20-a13f-4107-85dc-02114787ef48' +
-  '&scope=https%3A%2F%2Foutlook.office.com%2F.default%20openid%20profile%20offline_access' +
-  '&redirect_uri=https%3A%2F%2Foutlook.office365.com%2Fmail%2F' +
-  '&client-request-id=3166a2c6-aed3-80d6-a64d-4e428c914436' +
-  '&response_mode=fragment' +
-  '&client_info=1&clidata=1' +
-  '&domain_hint=hotmail.html%3FauthRedirect%3Dtrue' +
-  '&nonce=01a01e22-638c-71a9-866d-2457aa402638' +
-  '&state=eyJpZCI6IjAxYTAxZTIyLTYzOGMtNzI1YS1iMDZiLWI5NTVkYmE5MWUwOSIsIm1ldGEiOnsiaW50ZXJhY3Rpb25UeXBlIjoicmVkaXJlY3QifX0%3D%7CaHR0cHM6Ly9vdXRsb29rLm9mZmljZTM2NS5jb20vbWFpbC8wLz9iTz0x' +
-  '&claims=%7B%22access_token%22%3A%7B%22xms_cc%22%3A%7B%22values%22%3A%5B%22CP1%22%5D%7D%7D%7D' +
-  '&x-client-SKU=msal.js.browser&x-client-VER=5.12.0' +
-  '&response_type=code' +
-  '&code_challenge=oqJyEmbKI1Fr0JuALEuXxXykbuS4N9ZC3AouhpPzda8' +
-  '&code_challenge_method=S256' +
-  '&sso_reload=true';
+const LOGIN_URL = 'https://login.live.com/';
 
 const SIGNUP_TIMEOUT_MS = 300000; // 5 min — CAPTCHA may need manual solve
 const INBOX_TIMEOUT_MS = 120000;  // 2 min — wait for ElevenLabs verify email
-
-const CHROME_EXE = 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe';
-const PROFILE_DIR = 'D:\\VibeCoding\\mail-temp\\chrome-profile';
+const MS_LOGIN_TIMEOUT_MS = 15000;
 
 // ── Module-scope state for failure handler ───────────────────────────────────
-let context = null;
+let browser = null;
 let activePage = null;
 let currentStep = 'init';
 
@@ -92,14 +22,24 @@ function step(name) {
   console.log(`[step] ${name}`);
 }
 
-// (account persistence moved to Google Sheets via updateSheetRow)
-
 // ── Human-like typing ────────────────────────────────────────────────────────
 async function typeHuman(page, selector, text) {
   await page.click(selector);
   await page.fill(selector, '');
   for (const char of text) {
     await page.keyboard.type(char, { delay: 50 + Math.random() * 80 });
+  }
+
+  // A React re-render mid-typing silently drops the remaining characters, which previously
+  // produced a truncated email and a sign-in that failed three steps later. Verify and repair.
+  const landed = await page.inputValue(selector);
+  if (landed !== text) {
+    console.warn(`[type] field truncated (${landed.length}/${text.length} chars) - repairing`);
+    await page.fill(selector, text);
+    const repaired = await page.inputValue(selector);
+    if (repaired !== text) {
+      throw new Error(`Could not set ${selector}: wanted ${text.length} chars, field holds ${repaired.length}`);
+    }
   }
 }
 
@@ -112,54 +52,89 @@ function generatePassword() {
 }
 
 // ── Microsoft Outlook login ──────────────────────────────────────────────────
-// Returns the page after it has redirected to outlook.office365.com/mail/
-async function loginMicrosoft(hotmailEmail, hotmailPassword) {
-  step('MS login — open OAuth URL');
-  const loginPage = await context.newPage();
+// login.live.com → fill creds → redirect to Outlook inbox
+async function loginMicrosoft(ctx, hotmailEmail, hotmailPassword) {
+  step('MS login — open login page');
+  const loginPage = await ctx.newPage();
   activePage = loginPage;
 
-  await loginPage.goto(MS_OAUTH_URL, { waitUntil: 'domcontentloaded' });
+  await loginPage.goto(LOGIN_URL, { waitUntil: 'domcontentloaded' });
 
-  // Fill email
+  // Fill email (#usernameEntry)
   step('MS login — fill email');
-  await loginPage.waitForSelector('#i0116', { timeout: 15000 });
-  await typeHuman(loginPage, '#i0116', hotmailEmail);
+  await loginPage.waitForSelector('#usernameEntry', { timeout: 20000 });
+  await typeHuman(loginPage, '#usernameEntry', hotmailEmail);
   await loginPage.waitForTimeout(500 + Math.random() * 300);
 
   // Click Next
-  await loginPage.click('#idSIButton9');
-  await loginPage.waitForTimeout(1000 + Math.random() * 500);
+  await loginPage.click('button[data-testid="primaryButton"]');
+  await loginPage.waitForTimeout(1500 + Math.random() * 500);
 
-  // Click "Use your password"
+  // The passkey/authenticator interstitial is conditional — accounts without one land on the
+  // password field directly. Race the two so a missing prompt is not treated as a failure.
   step('MS login — switch to password');
-  await loginPage.waitForSelector('span[role="button"]:has-text("Use your password")', { timeout: 15000 });
-  await loginPage.click('span[role="button"]:has-text("Use your password")');
-  await loginPage.waitForTimeout(800 + Math.random() * 400);
+  const PASSWORD_LINK = 'span[role="button"]:has-text("Use your password")';
+  const route = await Promise.race([
+    loginPage.waitForSelector(PASSWORD_LINK, { timeout: MS_LOGIN_TIMEOUT_MS })
+      .then(() => 'link').catch(() => null),
+    loginPage.waitForSelector('#passwordEntry', { timeout: MS_LOGIN_TIMEOUT_MS })
+      .then(() => 'password').catch(() => null),
+  ]);
+  if (!route) {
+    throw new Error('MS login: neither the passkey link nor the password field appeared');
+  }
+  if (route === 'link') {
+    await loginPage.click(PASSWORD_LINK);
+    await loginPage.waitForTimeout(800 + Math.random() * 400);
+  }
 
-  // Fill password
+  // Fill password (#passwordEntry)
   step('MS login — fill password');
   await loginPage.waitForSelector('#passwordEntry', { timeout: 15000 });
   await typeHuman(loginPage, '#passwordEntry', hotmailPassword);
   await loginPage.waitForTimeout(500 + Math.random() * 300);
 
-  // Click Next to submit password
+  // Submit password (Next button)
   step('MS login — submit password');
-  await loginPage.click('button[type="submit"][data-testid="primaryButton"]:has-text("Next")');
-  await loginPage.waitForTimeout(1000 + Math.random() * 500);
+  await loginPage.click('button[data-testid="primaryButton"]');
+  await loginPage.waitForTimeout(2000);
 
-  // Click "No" on "Stay signed in?" prompt
-  step('MS login — click No (stay signed in)');
-  await loginPage.waitForSelector('button[type="submit"][data-testid="secondaryButton"]:has-text("No")', { timeout: 15000 });
-  await loginPage.click('button[type="submit"][data-testid="secondaryButton"]:has-text("No")');
+  // Dismiss passkey dialog if it appears (native OS dialog)
+  step('MS login — dismiss passkey dialog');
+  for (let i = 0; i < 3; i++) {
+    await loginPage.keyboard.press('Escape');
+    await loginPage.waitForTimeout(300);
+  }
 
-  // Wait for redirect into Outlook inbox
-  step('MS login — wait for Outlook inbox');
-  await loginPage.waitForURL(url => url.toString().includes('outlook.office365.com/mail'), {
-    timeout: 30000,
-  });
+  // After password, OK or "Stay signed in?" may appear — handle both
+  step('MS login — post-login prompts');
+  // Wait for either OK or No button to appear
+  const prompt = await Promise.race([
+    loginPage.waitForSelector('button:has-text("OK")', { timeout: 10000 }).then(() => 'ok').catch(() => null),
+    loginPage.waitForSelector('button:has-text("No")', { timeout: 10000 }).then(() => 'no').catch(() => null),
+  ]);
+
+  if (prompt === 'ok') {
+    await loginPage.click('button:has-text("OK")');
+    await loginPage.waitForTimeout(1500);
+    // After OK, No button may appear
+    const noBtn = await loginPage.waitForSelector('button:has-text("No")', { timeout: 10000 }).catch(() => null);
+    if (noBtn) {
+      await noBtn.click();
+      await loginPage.waitForTimeout(1500);
+    }
+  } else if (prompt === 'no') {
+    await loginPage.click('button:has-text("No")');
+    await loginPage.waitForTimeout(1500);
+  }
+
+  // Navigate to Outlook inbox (login.live.com redirects to account.microsoft.com by default)
+  step('MS login — navigate to Outlook inbox');
+  await loginPage.goto('https://outlook.live.com/mail/', { waitUntil: 'domcontentloaded' });
+  await loginPage.waitForTimeout(5000);
   console.log(`[MS] Inbox loaded: ${loginPage.url()}`);
 
-  return loginPage; // now the live Outlook inbox page
+  return loginPage;
 }
 
 // ── Poll Outlook inbox via DOM ────────────────────────────────────────────────
@@ -199,7 +174,7 @@ async function pollOutlookInbox(outookPage, timeoutMs = INBOX_TIMEOUT_MS) {
 }
 
 // ── Process one hotmail account end-to-end ───────────────────────────────────
-async function processAccount(cred) {
+async function processAccount(ctx, cred) {
   const { rowIndex, email: hotmailEmail, password: hotmailPassword, recoveryEmail } = cred;
   const elevenPassword = generatePassword();
 
@@ -209,15 +184,14 @@ async function processAccount(cred) {
   console.log(`  ElevenLabs password: ${elevenPassword}`);
 
   // 1. Login Microsoft → get Outlook inbox page
-  const outookPage = await loginMicrosoft(hotmailEmail, hotmailPassword);
+  const outookPage = await loginMicrosoft(ctx, hotmailEmail, hotmailPassword);
   activePage = outookPage;
 
   // 2. Sign up on ElevenLabs
   step('sign-up ElevenLabs');
-  const signupPage = await context.newPage();
+  const signupPage = await ctx.newPage();
   activePage = signupPage;
 
-  await context.clearCookies({ domain: 'elevenlabs.io' });
   await signupPage.goto('https://elevenlabs.io', { waitUntil: 'domcontentloaded' });
   await signupPage.evaluate(() => { localStorage.clear(); sessionStorage.clear(); });
 
@@ -249,6 +223,11 @@ async function processAccount(cred) {
     console.log(`[3] Signup complete (${settled})`);
   }
 
+  // The ElevenLabs account exists from here on. Record its password immediately so a later
+  // failure (verify, onboarding, key creation) cannot leave the account unrecoverable.
+  await updatePassword(rowIndex, elevenPassword)
+    .catch((e) => console.error(`[sheet] password write failed: ${e.message}`));
+
   // 4. Poll Outlook inbox
   step('poll Outlook inbox for verify email');
   activePage = outookPage;
@@ -257,7 +236,7 @@ async function processAccount(cred) {
 
   // 5. Open verify URL
   step('open verify URL');
-  const verifyPage = await context.newPage();
+  const verifyPage = await ctx.newPage();
   activePage = verifyPage;
   await verifyPage.goto(verifyUrl, { waitUntil: 'domcontentloaded' });
 
@@ -270,12 +249,25 @@ async function processAccount(cred) {
   // 7. Sign in
   step('sign in ElevenLabs');
   await verifyPage.waitForSelector('[data-testid="sign-in-email-input"]', { timeout: 15000 });
+  // Let hydration finish before typing - the signup step already does this.
+  await verifyPage.waitForTimeout(800 + Math.random() * 500);
   await typeHuman(verifyPage, '[data-testid="sign-in-email-input"]', hotmailEmail);
   await verifyPage.waitForTimeout(300);
   await typeHuman(verifyPage, '[data-testid="sign-in-password-input"]', elevenPassword);
   await verifyPage.waitForTimeout(400);
   await verifyPage.click('[data-testid="sign-in-submit-button"]');
-  await verifyPage.waitForTimeout(5000);
+
+  // Fail here rather than letting an unauthenticated session drift into onboarding and the
+  // key dialog, where the real cause is three steps behind the reported error.
+  const signedIn = await verifyPage
+    .waitForURL((url) => !url.toString().includes('/sign-in'), { timeout: 30000 })
+    .then(() => true).catch(() => false);
+  if (!signedIn) {
+    const shown = await verifyPage.locator('[data-testid="sign-in-email-input"]')
+      .inputValue().catch(() => '<no field>');
+    throw new Error(`Sign-in did not complete; still at ${verifyPage.url()} (email field: "${shown}")`);
+  }
+  await verifyPage.waitForTimeout(3000);
 
   // 8. Onboarding
   step('onboarding');
@@ -323,6 +315,20 @@ async function processAccount(cred) {
   await verifyPage.fill('input[placeholder="API Key Name"]', keyName);
   await verifyPage.waitForTimeout(500);
 
+  // Leaving "Restrict Key" on produces a key with no endpoint access - it is created and
+  // stored but every API call is rejected. Turn it off; checking state first keeps this
+  // correct if the default ever flips.
+  const restrictToggle = verifyPage.getByRole('dialog').getByRole('switch');
+  if (await restrictToggle.count() > 0) {
+    if (await restrictToggle.first().getAttribute('aria-checked') === 'true') {
+      await restrictToggle.first().click();
+      await verifyPage.waitForTimeout(500);
+      console.log('[9] Restrict Key toggled off (key gets full access)');
+    }
+  } else {
+    console.warn('[9] Restrict Key toggle not found - key may be created without permissions');
+  }
+
   await verifyPage
     .getByRole('dialog')
     .getByRole('button', { name: 'Create Key', exact: true })
@@ -353,55 +359,88 @@ async function processAccount(cred) {
   }
 
   console.log(`[9] API Key: ${apiKey}`);
-  console.log(`\n✅ Done: ${hotmailEmail} | ${elevenPassword} | ${apiKey}`);
 
-  // Write results back to Google Sheet
-  await updateSheetRow(rowIndex, apiKey, elevenPassword, 'complete');
+  // Write results back to Google Sheet. If this throws, the caller marks the row failed
+  // but leaves F/G alone - and the key is on stdout above, so it is not lost silently.
+  await updateResult(rowIndex, apiKey, elevenPassword, 'complete');
   console.log(`\n✅ Done: ${hotmailEmail} | ${elevenPassword} | ${apiKey}`);
-
-  // Close this account's tabs; browser stays open for the next account
-  await signupPage.close().catch(() => {});
-  await verifyPage.close().catch(() => {});
-  await outookPage.close().catch(() => {});
 }
 
 // ── Main loop ────────────────────────────────────────────────────────────────
+// --limit N  process at most N accounts (default: all)
+// --row N    process only the account on sheet row N
+function parseArgs(argv) {
+  const limitArg = argv.find((a) => a.startsWith('--limit='));
+  const rowArg = argv.find((a) => a.startsWith('--row='));
+  const limit = limitArg ? Number(limitArg.split('=')[1]) : Infinity;
+  const row = rowArg ? Number(rowArg.split('=')[1]) : null;
+  if (limitArg && (!Number.isInteger(limit) || limit < 1)) {
+    throw new Error(`--limit must be a positive integer, got: ${limitArg.split('=')[1]}`);
+  }
+  if (rowArg && (!Number.isInteger(row) || row < 2)) {
+    throw new Error(`--row must be a sheet row >= 2 (row 1 is the header), got: ${rowArg.split('=')[1]}`);
+  }
+  return { limit, row };
+}
+
 async function run() {
+  const { limit, row } = parseArgs(process.argv.slice(2));
+
   await initSheets();
-  const pendingRows = await loadPendingRows();
+  let pendingRows = await loadPendingRows();
   console.log(`Loaded ${pendingRows.length} pending accounts from Google Sheet`);
+
+  if (row !== null) {
+    pendingRows = pendingRows.filter((r) => r.rowIndex === row);
+    if (pendingRows.length === 0) {
+      console.log(`Row ${row} is not pending (or does not exist). Exiting.`);
+      return;
+    }
+  }
+
+  if (pendingRows.length > limit) {
+    pendingRows = pendingRows.slice(0, limit);
+    console.log(`Limited to first ${limit} account(s) by --limit.`);
+  }
 
   if (pendingRows.length === 0) {
     console.log('No pending accounts. Exiting.');
     return;
   }
 
-  step('launch Chrome');
-  context = await chromium.launchPersistentContext(PROFILE_DIR, {
+  step('launch Chromium');
+  browser = await chromium.launch({
     headless: false,
-    executablePath: CHROME_EXE,
     args: [
       '--disable-blink-features=AutomationControlled',
       '--no-sandbox',
       '--disable-infobars',
-      '--profile-directory=Default',
-      '--hide-crash-restore-bubble',
     ],
     ignoreDefaultArgs: ['--enable-automation'],
     slowMo: 50,
-    permissions: ['clipboard-read', 'clipboard-write'],
-  });
-  await context.addInitScript(() => {
-    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
   });
 
   for (let i = 0; i < pendingRows.length; i++) {
     const cred = pendingRows[i];
     console.log(`\n[${i + 1}/${pendingRows.length}] ${cred.email} (sheet row ${cred.rowIndex})`);
 
+    // Reset before the try: otherwise a throw raised before this account's first step() call
+    // would be attributed to the previous account's last step.
+    currentStep = 'account start';
+
+    // One context per account. A fresh context drops cookies, localStorage and IndexedDB, so
+    // the previous account's Microsoft session cannot leak into this login. Closing it also
+    // disposes every tab the account opened.
+    const ctx = await browser.newContext({
+      permissions: ['clipboard-read', 'clipboard-write'],
+    });
+    await ctx.addInitScript(() => {
+      Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+    });
+
     try {
-      await processAccount(cred);
-      // processAccount calls updateSheetRow on success internally
+      await processAccount(ctx, cred);
+      // processAccount writes the success row itself via updateResult.
     } catch (err) {
       console.error(`\n❌ FAILED [${cred.email}] at step: ${currentStep}`);
       console.error(err.stack || err.message);
@@ -410,19 +449,30 @@ async function run() {
       const isInactive = currentStep.startsWith('MS login');
       const failStatus = isInactive ? 'inactive' : `failed:${currentStep}`;
 
-      await updateSheetRow(cred.rowIndex, '', '', failStatus).catch(() => {});
+      // Status column only. Never blank F/G here: the ElevenLabs account may already exist
+      // with its password recorded, and losing it would orphan the account for good.
+      await updateStatus(cred.rowIndex, failStatus)
+        .catch((e) => console.error(`[sheet] status write failed: ${e.message}`));
 
       if (activePage && !activePage.isClosed()) {
         try {
-          await activePage.screenshot({ path: FAILURE_SCREENSHOT, fullPage: true });
-          console.error('[debug] Screenshot saved.');
-        } catch (_) {}
+          console.error(`[debug] URL: ${activePage.url()}`);
+          const text = await activePage.evaluate(() => document.body.innerText.slice(0, 600));
+          console.error(`[debug] Visible text:\n${text}`);
+          // Per-row filename: a shared path meant each failure erased the previous evidence.
+          const shot = FAILURE_SCREENSHOT.replace(/\.png$/, `-row${cred.rowIndex}.png`);
+          await activePage.screenshot({ path: shot, fullPage: true });
+          console.error(`[debug] Screenshot: ${shot}`);
+        } catch (e) {
+          console.error(`[debug] Capture failed: ${e.message}`);
+        }
       }
 
       console.log('Continuing to next account...');
+    } finally {
+      activePage = null;
+      await ctx.close().catch((e) => console.error(`[cleanup] ${e.message}`));
     }
-
-    activePage = null;
   }
 
   console.log('\n✅ All accounts processed.');
@@ -434,7 +484,7 @@ run()
     process.exitCode = 1;
   })
   .finally(async () => {
-    if (context) {
-      await context.close().catch((err) => console.error(`[cleanup] ${err.message}`));
+    if (browser) {
+      await browser.close().catch((err) => console.error(`[cleanup] ${err.message}`));
     }
   });
