@@ -1,7 +1,7 @@
 const { chromium } = require('playwright');
 const path = require('path');
 const {
-  initSheets, loadPendingRows, updateStatus, updatePassword, updateResult,
+  initSheets, loadRows, loadPendingRows, updateStatus, updatePassword, updateResult,
 } = require('./sheets');
 
 const FAILURE_SCREENSHOT = path.join(__dirname, 'debug-failure.png');
@@ -246,113 +246,177 @@ async function processAccount(ctx, cred) {
   await verifyPage.click('button:has-text("Continue")');
   await verifyPage.waitForTimeout(2000);
 
-  // 7. Sign in
-  step('sign in ElevenLabs');
-  await verifyPage.waitForSelector('[data-testid="sign-in-email-input"]', { timeout: 15000 });
-  // Let hydration finish before typing - the signup step already does this.
-  await verifyPage.waitForTimeout(800 + Math.random() * 500);
-  await typeHuman(verifyPage, '[data-testid="sign-in-email-input"]', hotmailEmail);
-  await verifyPage.waitForTimeout(300);
-  await typeHuman(verifyPage, '[data-testid="sign-in-password-input"]', elevenPassword);
-  await verifyPage.waitForTimeout(400);
-  await verifyPage.click('[data-testid="sign-in-submit-button"]');
+  await signInAndCreateKey(verifyPage, rowIndex, hotmailEmail, elevenPassword);
+}
 
-  // Fail here rather than letting an unauthenticated session drift into onboarding and the
-  // key dialog, where the real cause is three steps behind the reported error.
-  const signedIn = await verifyPage
-    .waitForURL((url) => !url.toString().includes('/sign-in'), { timeout: 30000 })
-    .then(() => true).catch(() => false);
-  if (!signedIn) {
-    const shown = await verifyPage.locator('[data-testid="sign-in-email-input"]')
-      .inputValue().catch(() => '<no field>');
-    throw new Error(`Sign-in did not complete; still at ${verifyPage.url()} (email field: "${shown}")`);
+// Grants every endpoint in the Create API Key dialog its most permissive setting.
+//
+// "Restrict Key" must stay ON: switching it off hides the endpoint list entirely, leaving
+// nothing to grant. Each endpoint renders as a Radix tablist whose tab ids carry a random
+// prefix but a stable suffix - -trigger-none / -trigger-access / -trigger-write - so the
+// suffix is what we match on. Rows offering Write get Write; the rest get Access.
+async function grantAllPermissions(page) {
+  const dialog = page.getByRole('dialog');
+
+  // The first switch in the dialog is Restrict Key; the later ones are "Restrict by IP
+  // address" and "Auto-disable if leaked", which are deliberately left as they are.
+  const restrictToggle = dialog.getByRole('switch').first();
+  if (await restrictToggle.count() === 0) {
+    throw new Error('Restrict Key toggle not found - dialog layout changed');
   }
-  await verifyPage.waitForTimeout(3000);
+  if (await restrictToggle.getAttribute('aria-checked') !== 'true') {
+    await restrictToggle.click();
+    await page.waitForTimeout(400);
+  }
 
+  const groups = dialog.locator('[role="tablist"]');
+  const total = await groups.count();
+  if (total === 0) throw new Error('No endpoint permission groups found in the dialog');
+
+  let granted = 0;
+  for (let i = 0; i < total; i++) {
+    const group = groups.nth(i);
+    const write = group.locator('button[id$="-trigger-write"]');
+    const target = (await write.count()) > 0
+      ? write.first()
+      : group.locator('button[id$="-trigger-access"]').first();
+
+    if (await target.count() === 0) continue;
+    if (await target.getAttribute('aria-selected') !== 'true') {
+      await target.click();
+      await page.waitForTimeout(80);
+    }
+    granted++;
+  }
+
+  // Verify rather than assume: a row still on "No Access" means the click did not register.
+  const stillNone = await dialog.locator('button[id$="-trigger-none"][aria-selected="true"]').count();
+  if (stillNone > 0) {
+    throw new Error(`${stillNone} endpoint(s) still set to No Access after granting`);
+  }
+  console.log(`[9] Granted max permissions on ${granted}/${total} endpoint group(s)`);
+}
+
+// Sign in, clear onboarding, mint an API key and record the result. Shared by the full
+// pipeline and by --resume, where the account already exists and only the key is missing.
+// Submits the sign-in form and reports which of the three outcomes occurred. The caller
+// decides what to do, because the right response differs: a verified account proceeds, an
+// unverified one needs its mailbox, and rejected credentials cannot be recovered here.
+const SIGN_IN = { OK: 'ok', UNVERIFIED: 'unverified', REJECTED: 'rejected' };
+
+async function attemptSignIn(page, email, elevenPassword) {
+  step('sign in ElevenLabs');
+  await page.waitForSelector('[data-testid="sign-in-email-input"]', { timeout: 15000 });
+  // Let hydration finish before typing - the signup step already does this.
+  await page.waitForTimeout(800 + Math.random() * 500);
+  await typeHuman(page, '[data-testid="sign-in-email-input"]', email);
+  await page.waitForTimeout(300);
+  await typeHuman(page, '[data-testid="sign-in-password-input"]', elevenPassword);
+  await page.waitForTimeout(400);
+  await page.click('[data-testid="sign-in-submit-button"]');
+
+  const left = page.waitForURL((url) => !url.toString().includes('/sign-in'), { timeout: 30000 })
+    .then(() => SIGN_IN.OK).catch(() => null);
+  // ElevenLabs keeps the URL on /sign-in for both of these, so match on the message.
+  const unverified = page.getByText('verification link', { exact: false })
+    .waitFor({ timeout: 30000 }).then(() => SIGN_IN.UNVERIFIED).catch(() => null);
+  const rejected = page.getByText('No user is found', { exact: false })
+    .waitFor({ timeout: 30000 }).then(() => SIGN_IN.REJECTED).catch(() => null);
+
+  const outcome = await Promise.race([left, unverified, rejected]);
+  if (!outcome) {
+    const shown = await page.locator('[data-testid="sign-in-email-input"]')
+      .inputValue().catch(() => '<no field>');
+    throw new Error(`Sign-in gave no recognised outcome; still at ${page.url()} (email field: "${shown}")`);
+  }
+  return outcome;
+}
+
+async function signInAndCreateKey(page, rowIndex, email, elevenPassword) {
+  const outcome = await attemptSignIn(page, email, elevenPassword);
+  if (outcome !== SIGN_IN.OK) {
+    throw new Error(`Sign-in did not complete (${outcome}) at ${page.url()}`);
+  }
+  await page.waitForTimeout(3000);
+
+  await finishOnboardingAndKey(page, rowIndex, email, elevenPassword);
+}
+
+// Onboarding, key creation and the sheet write. Split out so --resume can reach it
+// without repeating the sign-up half of the pipeline.
+async function finishOnboardingAndKey(page, rowIndex, email, elevenPassword) {
   // 8. Onboarding
   step('onboarding');
   const firstName = ['Alex', 'Jordan', 'Taylor', 'Morgan', 'Casey', 'Riley'][Math.floor(Math.random() * 6)];
 
-  await verifyPage.waitForSelector('button:has-text("Continue")', { timeout: 10000 })
-    .then(() => verifyPage.click('button:has-text("Continue")'))
+  await page.waitForSelector('button:has-text("Continue")', { timeout: 10000 })
+    .then(() => page.click('button:has-text("Continue")'))
     .catch(() => {});
-  await verifyPage.waitForTimeout(1500);
+  await page.waitForTimeout(1500);
 
-  const firstNameInput = await verifyPage.$('#firstname');
+  const firstNameInput = await page.$('#firstname');
   if (firstNameInput) {
-    await typeHuman(verifyPage, '#firstname', firstName);
-    await verifyPage.waitForTimeout(500);
-    const ageCheckbox = await verifyPage.$('.checkbox-hitarea');
-    if (ageCheckbox) { await ageCheckbox.click(); await verifyPage.waitForTimeout(300); }
-    await verifyPage.click('button[type="submit"]:has-text("Next")');
-    await verifyPage.waitForTimeout(1500);
+    await typeHuman(page, '#firstname', firstName);
+    await page.waitForTimeout(500);
+    const ageCheckbox = await page.$('.checkbox-hitarea');
+    if (ageCheckbox) { await ageCheckbox.click(); await page.waitForTimeout(300); }
+    await page.click('button[type="submit"]:has-text("Next")');
+    await page.waitForTimeout(1500);
   }
 
   for (let i = 0; i < 3; i++) {
-    const skip = await verifyPage.$('button:has-text("Skip")');
-    if (skip) { await skip.click(); await verifyPage.waitForTimeout(1000); }
+    const skip = await page.$('button:has-text("Skip")');
+    if (skip) { await skip.click(); await page.waitForTimeout(1000); }
   }
 
   // 9. Create API key
   step('create API key');
-  await verifyPage.goto('https://elevenlabs.io/app/developers/api-keys', { waitUntil: 'domcontentloaded' });
-  await verifyPage.waitForTimeout(2000);
+  await page.goto('https://elevenlabs.io/app/developers/api-keys', { waitUntil: 'domcontentloaded' });
+  await page.waitForTimeout(2000);
 
-  await verifyPage.waitForSelector('button:has-text("Got it")', { timeout: 5000 })
-    .then(() => verifyPage.click('button:has-text("Got it")'))
+  await page.waitForSelector('button:has-text("Got it")', { timeout: 5000 })
+    .then(() => page.click('button:has-text("Got it")'))
     .catch(() => {});
-  await verifyPage.waitForTimeout(500);
-  await verifyPage.keyboard.press('Escape');
-  await verifyPage.waitForTimeout(300);
+  await page.waitForTimeout(500);
+  await page.keyboard.press('Escape');
+  await page.waitForTimeout(300);
 
-  await verifyPage.waitForSelector('button:has-text("Create Key")', { timeout: 10000 });
-  await verifyPage.click('button:has-text("Create Key")');
-  await verifyPage.waitForTimeout(1000);
+  await page.waitForSelector('button:has-text("Create Key")', { timeout: 10000 });
+  await page.click('button:has-text("Create Key")');
+  await page.waitForTimeout(1000);
 
   const keyName = 'Key-' + Math.random().toString(36).slice(2, 8).toUpperCase();
-  await verifyPage.waitForSelector('input[placeholder="API Key Name"]', { timeout: 10000 });
-  await verifyPage.fill('input[placeholder="API Key Name"]', '');
-  await verifyPage.fill('input[placeholder="API Key Name"]', keyName);
-  await verifyPage.waitForTimeout(500);
+  await page.waitForSelector('input[placeholder="API Key Name"]', { timeout: 10000 });
+  await page.fill('input[placeholder="API Key Name"]', '');
+  await page.fill('input[placeholder="API Key Name"]', keyName);
+  await page.waitForTimeout(500);
 
-  // Leaving "Restrict Key" on produces a key with no endpoint access - it is created and
-  // stored but every API call is rejected. Turn it off; checking state first keeps this
-  // correct if the default ever flips.
-  const restrictToggle = verifyPage.getByRole('dialog').getByRole('switch');
-  if (await restrictToggle.count() > 0) {
-    if (await restrictToggle.first().getAttribute('aria-checked') === 'true') {
-      await restrictToggle.first().click();
-      await verifyPage.waitForTimeout(500);
-      console.log('[9] Restrict Key toggled off (key gets full access)');
-    }
-  } else {
-    console.warn('[9] Restrict Key toggle not found - key may be created without permissions');
-  }
+  await grantAllPermissions(page);
 
-  await verifyPage
+  await page
     .getByRole('dialog')
     .getByRole('button', { name: 'Create Key', exact: true })
     .last()
     .click({ timeout: 10000 });
-  await verifyPage.waitForTimeout(1000);
+  await page.waitForTimeout(1000);
 
   // Confirm "No Permissions Selected" dialog if it appears
-  const confirmCreate = verifyPage.locator('button[data-agent-protected="true"]', { hasText: 'Create Key' });
+  const confirmCreate = page.locator('button[data-agent-protected="true"]', { hasText: 'Create Key' });
   if (await confirmCreate.count() > 0) {
     await confirmCreate.last().click({ timeout: 10000 });
-    await verifyPage.waitForTimeout(1500);
+    await page.waitForTimeout(1500);
   }
 
-  const keyDialog = verifyPage.getByRole('dialog');
-  await verifyPage
+  const keyDialog = page.getByRole('dialog');
+  await page
     .getByRole('button', { name: 'Copy to Clipboard', exact: true })
     .click({ timeout: 15000 });
-  await verifyPage.waitForTimeout(500);
+  await page.waitForTimeout(500);
 
   let apiKey = await keyDialog.locator('input[readonly]').first().inputValue().catch(() => '');
   if (!apiKey) {
-    await verifyPage.bringToFront();
-    apiKey = await verifyPage.evaluate(() => navigator.clipboard.readText()).catch(() => '');
+    await page.bringToFront();
+    apiKey = await page.evaluate(() => navigator.clipboard.readText()).catch(() => '');
   }
   if (!apiKey.startsWith('sk_')) {
     throw new Error(`API key not captured (got: ${JSON.stringify(apiKey)})`);
@@ -363,7 +427,71 @@ async function processAccount(ctx, cred) {
   // Write results back to Google Sheet. If this throws, the caller marks the row failed
   // but leaves F/G alone - and the key is on stdout above, so it is not lost silently.
   await updateResult(rowIndex, apiKey, elevenPassword, 'complete');
-  console.log(`\n✅ Done: ${hotmailEmail} | ${elevenPassword} | ${apiKey}`);
+  console.log(`\n✅ Done: ${email} | ${elevenPassword} | ${apiKey}`);
+}
+
+// Picks up an account that already exists but has no key. Three states are possible and
+// they need different handling, so the sign-in outcome drives the branch:
+//   ok         - verified account, go straight to the key dialog
+//   unverified - signup landed but the verify link was never completed; fetch it from Outlook
+//   rejected   - the stored password does not open the account; nothing to do here
+async function resumeAccount(ctx, cred) {
+  const { rowIndex, email, password: hotmailPassword, elevenPass } = cred;
+
+  console.log(`
+${'═'.repeat(60)}`);
+  console.log(`▶ RESUME ${email} (sheet row ${rowIndex})`);
+  console.log(`${'═'.repeat(60)}`);
+
+  step('resume — open sign-in');
+  let page = await ctx.newPage();
+  activePage = page;
+  await page.goto('https://elevenlabs.io/app/sign-in', { waitUntil: 'domcontentloaded' });
+
+  let outcome = await attemptSignIn(page, email, elevenPass);
+
+  if (outcome === SIGN_IN.REJECTED) {
+    // Most likely the signup password was truncated before typeHuman verified its input, so
+    // the stored password never matched. Recovering needs a password reset, which this script
+    // does not do - flag it distinctly instead of leaving a misleading 'failed:<step>'.
+    console.error(`[resume] Credentials rejected for ${email}; a password reset is required.`);
+    await updateStatus(rowIndex, 'credentials-rejected');
+    return;
+  }
+
+  if (outcome === SIGN_IN.UNVERIFIED) {
+    console.log('[resume] Account exists but its email is unverified; fetching the link.');
+
+    step('resume — MS login for verify link');
+    const outlookPage = await loginMicrosoft(ctx, email, hotmailPassword);
+    activePage = outlookPage;
+
+    step('resume — poll Outlook for verify email');
+    const verifyUrl = await pollOutlookInbox(outlookPage, INBOX_TIMEOUT_MS);
+    console.log('[resume] Verify URL found:', verifyUrl.substring(0, 80) + '...');
+
+    step('resume — open verify URL');
+    page = await ctx.newPage();
+    activePage = page;
+    await page.goto(verifyUrl, { waitUntil: 'domcontentloaded' });
+
+    step('resume — click Continue');
+    await page.waitForSelector('button:has-text("Continue")', { timeout: 15000 });
+    await page.click('button:has-text("Continue")');
+    await page.waitForTimeout(2000);
+
+    outcome = await attemptSignIn(page, email, elevenPass);
+    if (outcome !== SIGN_IN.OK) {
+      throw new Error(`Sign-in still failed after verifying (${outcome})`);
+    }
+    await page.waitForTimeout(3000);
+
+    await finishOnboardingAndKey(page, rowIndex, email, elevenPass);
+    return;
+  }
+
+  await page.waitForTimeout(3000);
+  await finishOnboardingAndKey(page, rowIndex, email, elevenPass);
 }
 
 // ── Main loop ────────────────────────────────────────────────────────────────
@@ -372,6 +500,7 @@ async function processAccount(ctx, cred) {
 function parseArgs(argv) {
   const limitArg = argv.find((a) => a.startsWith('--limit='));
   const rowArg = argv.find((a) => a.startsWith('--row='));
+  const resume = argv.includes('--resume');
   const limit = limitArg ? Number(limitArg.split('=')[1]) : Infinity;
   const row = rowArg ? Number(rowArg.split('=')[1]) : null;
   if (limitArg && (!Number.isInteger(limit) || limit < 1)) {
@@ -380,15 +509,27 @@ function parseArgs(argv) {
   if (rowArg && (!Number.isInteger(row) || row < 2)) {
     throw new Error(`--row must be a sheet row >= 2 (row 1 is the header), got: ${rowArg.split('=')[1]}`);
   }
-  return { limit, row };
+  return { limit, row, resume };
 }
 
 async function run() {
-  const { limit, row } = parseArgs(process.argv.slice(2));
+  const { limit, row, resume } = parseArgs(process.argv.slice(2));
 
   await initSheets();
-  let pendingRows = await loadPendingRows();
-  console.log(`Loaded ${pendingRows.length} pending accounts from Google Sheet`);
+
+  // --resume targets accounts that already exist: a password was recorded but no key was
+  // ever captured. Returning these to 'pending' would not work - signup rejects the email
+  // as already registered - so they are selected by content, not by status.
+  let pendingRows;
+  if (resume) {
+    pendingRows = (await loadRows()).filter(
+      (r) => r.status !== 'complete' && r.elevenPass && !r.apiKey,
+    );
+    console.log(`Loaded ${pendingRows.length} resumable accounts from Google Sheet`);
+  } else {
+    pendingRows = await loadPendingRows();
+    console.log(`Loaded ${pendingRows.length} pending accounts from Google Sheet`);
+  }
 
   if (row !== null) {
     pendingRows = pendingRows.filter((r) => r.rowIndex === row);
@@ -404,7 +545,7 @@ async function run() {
   }
 
   if (pendingRows.length === 0) {
-    console.log('No pending accounts. Exiting.');
+    console.log(resume ? 'No resumable accounts. Exiting.' : 'No pending accounts. Exiting.');
     return;
   }
 
@@ -439,14 +580,14 @@ async function run() {
     });
 
     try {
-      await processAccount(ctx, cred);
-      // processAccount writes the success row itself via updateResult.
+      // Both paths write the success row themselves via updateResult.
+      await (resume ? resumeAccount(ctx, cred) : processAccount(ctx, cred));
     } catch (err) {
       console.error(`\n❌ FAILED [${cred.email}] at step: ${currentStep}`);
       console.error(err.stack || err.message);
 
       // Classify failure: MS login steps = account inactive/bad creds
-      const isInactive = currentStep.startsWith('MS login');
+      const isInactive = !resume && currentStep.startsWith('MS login');
       const failStatus = isInactive ? 'inactive' : `failed:${currentStep}`;
 
       // Status column only. Never blank F/G here: the ElevenLabs account may already exist
