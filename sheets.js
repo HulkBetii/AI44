@@ -12,8 +12,18 @@ const COL = {
 
 let sheetsClient = null;
 
-async function initSheets() {
-  const credentials = require('./service-account.json');
+function loadCredentials() {
+  try {
+    return require('./service-account.json');
+  } catch {
+    throw new Error(
+      'service-account.json not found in the project root. Place the Google service account ' +
+      'key there; it is gitignored and never committed.');
+  }
+}
+
+// Credentials are injectable so tests can drive the sheet helpers without a real key file.
+async function initSheets(credentials = loadCredentials()) {
   const auth = new google.auth.GoogleAuth({
     credentials,
     scopes: ['https://www.googleapis.com/auth/spreadsheets'],

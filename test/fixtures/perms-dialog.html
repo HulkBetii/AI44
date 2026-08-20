@@ -1,0 +1,58 @@
+<!doctype html><html><body>
+<div role="dialog" data-state="open">
+  <h2>Create API Key</h2>
+  <input placeholder="API Key Name" type="text" value="Majestic Bearded Vulture">
+
+  <label for="restrict">Restrict Key</label>
+  <button type="button" role="switch" aria-checked="true" data-state="checked" id="restrict"></button>
+
+  <p>Endpoints</p>
+  <ul id="endpoints"></ul>
+
+  <label>Restrict by IP address</label>
+  <button type="button" role="switch" aria-checked="false" data-state="unchecked" id="ip"></button>
+
+  <label>Auto-disable if leaked</label>
+  <button type="button" role="switch" aria-checked="true" data-state="checked" id="leak"></button>
+
+  <button id="cancel">Cancel</button>
+  <button id="create">Create Key</button>
+</div>
+<script>
+// Mirror the real dialog: 2-tab rows (none/access) and 3-tab rows (none/read/write).
+const rows = [
+  ['Text to Speech', ['none','access']],
+  ['Speech to Speech', ['none','access']],
+  ['Sound Effects', ['none','access']],
+  ['Dubbing', ['none','read','write']],
+  ['ElevenAgents', ['none','read','write']],
+  ['Voices', ['none','read','write']],
+  ['Models', ['none','access']],
+  ['Workspace', ['none','read','write']],
+  ['Webhooks', ['none','access']],
+];
+const ul = document.getElementById('endpoints');
+rows.forEach(([name, tabs], i) => {
+  const prefix = 'radix-_r_' + Math.random().toString(36).slice(2,6) + i + '_';
+  const li = document.createElement('li');
+  li.innerHTML = '<p><span>' + name + '</span></p><div role="tablist">' +
+    tabs.map(t => '<button type="button" role="tab" aria-selected="' + (t === 'none') +
+      '" id="' + prefix + '-trigger-' + t + '"><p>' + t + '</p></button>').join('') + '</div>';
+  ul.appendChild(li);
+});
+// Radix-like behaviour so a click actually moves the selection.
+document.querySelectorAll('[role="tablist"]').forEach(tl => {
+  tl.addEventListener('click', e => {
+    const btn = e.target.closest('button[role="tab"]');
+    if (!btn) return;
+    tl.querySelectorAll('button[role="tab"]').forEach(b => b.setAttribute('aria-selected', String(b === btn)));
+  });
+});
+document.querySelectorAll('[role="switch"]').forEach(sw => {
+  sw.addEventListener('click', () => {
+    const on = sw.getAttribute('aria-checked') === 'true';
+    sw.setAttribute('aria-checked', String(!on));
+  });
+});
+</script>
+</body></html>

@@ -8,7 +8,7 @@ const FAILURE_SCREENSHOT = path.join(__dirname, 'debug-failure.png');
 
 const LOGIN_URL = 'https://login.live.com/';
 
-const SIGNUP_TIMEOUT_MS = 300000; // 5 min — CAPTCHA may need manual solve
+const SIGNUP_TIMEOUT_MS = 900000; // 15 min - CAPTCHA is solved by hand, allow for a break
 const INBOX_TIMEOUT_MS = 120000;  // 2 min — wait for ElevenLabs verify email
 const MS_LOGIN_TIMEOUT_MS = 15000;
 
@@ -141,6 +141,45 @@ async function loginMicrosoft(ctx, hotmailEmail, hotmailPassword) {
   return loginPage;
 }
 
+
+// The CAPTCHA is solved by hand, and this is the only point in a run that needs a person.
+// Ring the terminal bell and raise the window so the wait can be spent elsewhere, then tick
+// every 30s so a live wait is distinguishable from a hung one.
+async function waitForManualSignup(page) {
+  const BELL = String.fromCharCode(7);
+  const TICK_MS = 30000;
+  const totalSec = Math.round(SIGNUP_TIMEOUT_MS / 1000);
+
+  process.stdout.write(BELL);
+  await page.bringToFront().catch(() => {});
+  console.log(`⚠️  Solve the CAPTCHA in the browser window if shown (up to ${Math.round(SIGNUP_TIMEOUT_MS / 60000)} min).`);
+
+  const started = Date.now();
+  let ticks = 0;
+  const ticker = setInterval(() => {
+    ticks++;
+    console.log(`   …waiting ${Math.round((Date.now() - started) / 1000)}s / ${totalSec}s`);
+    // Re-ring once a minute rather than every tick: enough to call someone back, not enough
+    // to madden someone already sitting there.
+    if (ticks % 2 === 0) process.stdout.write(BELL);
+  }, TICK_MS);
+
+  try {
+    const settled = await Promise.race([
+      page.waitForURL((url) => !url.toString().includes('/sign-up'), { timeout: SIGNUP_TIMEOUT_MS })
+        .then(() => 'url-changed').catch(() => null),
+      page.waitForSelector('button:has-text("Resend")', { timeout: SIGNUP_TIMEOUT_MS })
+        .then(() => 'resend-shown').catch(() => null),
+    ]);
+    if (!settled) {
+      throw new Error(`Signup timed out after ${totalSec}s (still at ${page.url()})`);
+    }
+    return settled;
+  } finally {
+    clearInterval(ticker);
+  }
+}
+
 // ── Poll Outlook inbox via DOM ────────────────────────────────────────────────
 async function pollOutlookInbox(outookPage, timeoutMs = INBOX_TIMEOUT_MS, mode = 'verifyEmail') {
   const start = Date.now();
@@ -216,16 +255,7 @@ async function processAccount(ctx, cred) {
   // 3. Handle CAPTCHA
   step('wait for signup (CAPTCHA may need manual solve)');
   if (signupPage.url().includes('sign-up')) {
-    console.log('\n⚠️  Solve the CAPTCHA in the browser window if shown.');
-    const settled = await Promise.race([
-      signupPage.waitForURL(url => !url.toString().includes('/sign-up'), { timeout: SIGNUP_TIMEOUT_MS })
-        .then(() => 'url-changed').catch(() => null),
-      signupPage.waitForSelector('button:has-text("Resend")', { timeout: SIGNUP_TIMEOUT_MS })
-        .then(() => 'resend-shown').catch(() => null),
-    ]);
-    if (!settled) {
-      throw new Error(`Signup timed out (still at ${signupPage.url()})`);
-    }
+    const settled = await waitForManualSignup(signupPage);
     console.log(`[3] Signup complete (${settled})`);
   }
 

@@ -1,0 +1,60 @@
+<!doctype html><html><head><style>
+  body { font-family: sans-serif; }
+  .wrap { width: 360px; margin: 40px auto; }
+  .field { position: relative; }
+  .field input { width: 100%; height: 46px; box-sizing: border-box; padding: 0 16px; }
+  .field input[type=password] { padding-right: 40px; }
+  .toggle { position: absolute; inset-block: 0; right: 0; padding: 0 16px; }
+  .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+  button[disabled] { background: #999; }
+</style></head><body>
+<div class="wrap">
+<h1>Welcome back</h1>
+<form id="sign-in-form" action="/sign-in" method="POST">
+  <label for="email">Email</label>
+  <div class="field">
+    <input data-testid="sign-in-email-input" autocomplete="email" required type="email" name="email">
+  </div>
+  <label for="password">Password</label>
+  <div class="field">
+    <input data-testid="sign-in-password-input" autocomplete="current-password" required type="password" name="password">
+    <!-- Overlays the right edge of the password input, as in the real form. -->
+    <button type="button" data-agent-id="password-visibility-toggle" class="toggle">o</button>
+  </div>
+  <span id="forgot">Forgot your password?</span>
+  <button data-testid="sign-in-submit-button" data-loading="false" disabled>
+    <span class="sr-only">Sign in</span>
+  </button>
+</form>
+<div id="msg"></div>
+</div>
+<script>
+const mode = new URLSearchParams(location.search).get('mode');
+const email = document.querySelector('[data-testid="sign-in-email-input"]');
+const pass = document.querySelector('[data-testid="sign-in-password-input"]');
+const submit = document.querySelector('[data-testid="sign-in-submit-button"]');
+// Submit only enables once both fields are populated, like the real form.
+const sync = () => { submit.disabled = !(email.checkValidity() && email.value && pass.value); };
+email.addEventListener('input', sync);
+pass.addEventListener('input', sync);
+// The visibility toggle must never swallow the click meant for the input.
+document.querySelector('.toggle').addEventListener('click', () => {
+  window.__toggleClicked = (window.__toggleClicked || 0) + 1;
+  pass.type = pass.type === 'password' ? 'text' : 'password';
+});
+submit.addEventListener('click', (e) => {
+  e.preventDefault();
+  setTimeout(() => {
+    if (mode === 'ok') { location.href = 'home.html'; return; }
+    if (mode === 'unverified') {
+      document.getElementById('msg').textContent =
+        "We've sent a verification link to " + email.value + ". If you don't see it within 5 minutes, please check your spam or click resend.";
+      return;
+    }
+    if (mode === 'rejected') {
+      document.getElementById('msg').textContent = 'No user is found with these credentials.';
+    }
+  }, 200);
+});
+</script>
+</body></html>
