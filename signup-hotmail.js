@@ -24,7 +24,11 @@ function step(name) {
 
 // ── Human-like typing ────────────────────────────────────────────────────────
 async function typeHuman(page, selector, text) {
-  await page.click(selector);
+  // Attach the URL: a field that vanishes mid-flow means the page navigated under us, and
+  // the bare Playwright timeout does not say where we ended up.
+  await page.click(selector).catch((e) => {
+    throw new Error(`${e.message.split('\n')[0]} (page is at ${page.url()})`);
+  });
   await page.fill(selector, '');
   for (const char of text) {
     await page.keyboard.type(char, { delay: 50 + Math.random() * 80 });
@@ -138,39 +142,41 @@ async function loginMicrosoft(ctx, hotmailEmail, hotmailPassword) {
 }
 
 // ── Poll Outlook inbox via DOM ────────────────────────────────────────────────
-async function pollOutlookInbox(outookPage, timeoutMs = INBOX_TIMEOUT_MS) {
+async function pollOutlookInbox(outookPage, timeoutMs = INBOX_TIMEOUT_MS, mode = 'verifyEmail') {
   const start = Date.now();
+  const wanted = `mode=${mode}`;
 
   while (Date.now() - start < timeoutMs) {
     try {
       await outookPage.reload({ waitUntil: 'domcontentloaded' });
       await outookPage.waitForTimeout(2000);
 
-      // Outlook renders each message row with role="option"
-      const emailRow = await outookPage.$(
-        '[role="option"]:has-text("ElevenLabs"), [aria-label*="ElevenLabs"]'
-      );
+      // Outlook renders each message row with role="option".
+      const rows = outookPage.locator('[role="option"]').filter({ hasText: 'ElevenLabs' });
+      const count = await rows.count();
 
-      if (emailRow) {
-        await emailRow.click();
+      // Open each ElevenLabs message in turn rather than only the newest: the mailbox can
+      // already hold a message of the other kind - an old verification link when a reset
+      // link is wanted - and taking the first match would return the wrong one.
+      for (let i = 0; i < count; i++) {
+        await rows.nth(i).click();
         await outookPage.waitForTimeout(2000);
 
-        // Extract verify link from reading pane HTML
         const body = await outookPage.evaluate(() => document.body.innerHTML);
-        const match = body.match(/href="(https:\/\/elevenlabs\.io\/app\/action[^"]+)"/);
-        if (match) {
-          return match[1].replace(/&amp;/g, '&');
-        }
+        const link = [...body.matchAll(/href="(https:\/\/elevenlabs\.io\/app\/action[^"]+)"/g)]
+          .map((m) => m[1].replace(/&amp;/g, '&'))
+          .find((u) => u.includes(wanted));
+        if (link) return link;
       }
     } catch (e) {
       console.log(`[inbox] scan error: ${e.message}`);
     }
 
-    console.log('[inbox] No verify email yet, waiting 5s...');
+    console.log(`[inbox] No ${mode} email yet, waiting 5s...`);
     await outookPage.waitForTimeout(5000);
   }
 
-  throw new Error('Timeout: no ElevenLabs verification email in Outlook inbox');
+  throw new Error(`Timeout: no ElevenLabs ${mode} email in Outlook inbox`);
 }
 
 // ── Process one hotmail account end-to-end ───────────────────────────────────
@@ -430,6 +436,148 @@ async function finishOnboardingAndKey(page, rowIndex, email, elevenPassword) {
   console.log(`\n✅ Done: ${email} | ${elevenPassword} | ${apiKey}`);
 }
 
+// Returns the first selector that exists on the page. Used where the exact markup has not
+// been observed yet: on failure it prints the controls the page actually has, so a single
+// real run is enough to pin the right selector down.
+async function firstPresent(page, selectors, what) {
+  for (const selector of selectors) {
+    if (await page.locator(selector).count() > 0) return selector;
+  }
+  const controls = await page.evaluate(() =>
+    [...document.querySelectorAll('input, button')].slice(0, 30).map((el) => ({
+      tag: el.tagName.toLowerCase(),
+      type: el.getAttribute('type'),
+      testid: el.getAttribute('data-testid'),
+      name: el.getAttribute('name'),
+      placeholder: el.getAttribute('placeholder'),
+      text: (el.textContent || '').trim().slice(0, 40),
+    })));
+  console.error(`[reset] ${what} not found at ${page.url()}. Controls on the page:`);
+  for (const c of controls) console.error('   ', JSON.stringify(c));
+  throw new Error(`${what} not found`);
+}
+
+// Recovers a row whose stored password no longer opens the account, by driving the
+// "Forgot your password?" flow through the account's own Hotmail mailbox and choosing a
+// fresh password. Reuses loginMicrosoft and pollOutlookInbox from the main pipeline.
+async function resetPasswordAndCreateKey(ctx, cred) {
+  const { rowIndex, email, password: hotmailPassword } = cred;
+  const newPassword = generatePassword();
+
+  console.log(`
+${'═'.repeat(60)}`);
+  console.log(`▶ RESET ${email} (sheet row ${rowIndex})`);
+  console.log(`${'═'.repeat(60)}`);
+  console.log(`  New ElevenLabs password: ${newPassword}`);
+
+  step('reset — request reset email');
+  let page = await ctx.newPage();
+  activePage = page;
+  // The form has its own route, so go straight there instead of hunting for the link.
+  await page.goto('https://elevenlabs.io/app/sign-in/forgot-password', { waitUntil: 'domcontentloaded' });
+  await page.waitForSelector('[data-testid="forgot-password-email-input"]', { timeout: 15000 });
+  await page.waitForTimeout(800 + Math.random() * 500);
+
+  await typeHuman(page, '[data-testid="forgot-password-email-input"]', email);
+  await page.waitForTimeout(400);
+
+  // Continue starts disabled and enables once the address validates; click() waits for that.
+  await page.getByRole('button', { name: 'Continue', exact: true }).click({ timeout: 15000 });
+
+  // Confirm the request actually went out. Without this a silent failure would send us to
+  // the mailbox to wait two minutes for an email that was never sent.
+  await page.getByText('Check your Inbox', { exact: false })
+    .waitFor({ timeout: 20000 })
+    .catch(() => {
+      throw new Error(`Reset request not confirmed; still at ${page.url()}`);
+    });
+  console.log('[reset] Reset email requested.');
+
+  step('reset — MS login for reset link');
+  const outlookPage = await loginMicrosoft(ctx, email, hotmailPassword);
+  activePage = outlookPage;
+
+  step('reset — poll Outlook for reset link');
+  const resetUrl = await pollOutlookInbox(outlookPage, INBOX_TIMEOUT_MS, 'resetPassword');
+  console.log('[reset] Reset URL found:', resetUrl.substring(0, 80) + '...');
+
+  step('reset — set new password');
+  page = await ctx.newPage();
+  activePage = page;
+  await page.goto(resetUrl, { waitUntil: 'domcontentloaded' });
+  await page.waitForSelector('input[type="password"]', { timeout: 20000 });
+  await page.waitForTimeout(1000);
+
+  // "Your new password" and "Repeat new password". Neither carries a data-testid, and each
+  // has a visibility toggle overlaying its right edge - fill() sets the value without
+  // clicking, so the toggle cannot intercept. :visible guards against the hidden
+  // autocomplete input ElevenLabs ships on its other auth forms.
+  const fields = page.locator('input[type="password"]:visible');
+  const fieldCount = await fields.count();
+  if (fieldCount === 0) {
+    await firstPresent(page, ['input[type="password"]:visible'], 'new password field');
+  }
+  for (let i = 0; i < fieldCount; i++) {
+    await fields.nth(i).fill(newPassword);
+    await page.waitForTimeout(200);
+  }
+  console.log(`[reset] Filled ${fieldCount} password field(s).`);
+
+  const saveButton = page.getByRole('button', { name: 'Change Password', exact: true });
+
+  // The button unlocks only once every rule passes. Waiting on click() alone would burn the
+  // full timeout and report nothing useful, so surface which rule rejected the password.
+  const enabled = await saveButton.waitFor({ state: 'attached', timeout: 10000 })
+    .then(() => page.waitForFunction(
+      () => {
+        const b = [...document.querySelectorAll('button[type="submit"]')]
+          .find((el) => el.textContent.includes('Change Password'));
+        return b ? !b.disabled : false;
+      },
+      { timeout: 10000 },
+    ).then(() => true).catch(() => false))
+    .catch(() => false);
+
+  if (!enabled) {
+    const rules = await page.evaluate(() =>
+      [...document.querySelectorAll('p.text-xs')].map((el) => el.textContent.trim()));
+    console.error(`[reset] "Change Password" stayed disabled for a ${newPassword.length}-char password.`);
+    console.error(`[reset] Form requirements: ${rules.join(' | ')}`);
+    throw new Error('New password rejected by the form validator');
+  }
+
+  await saveButton.click({ timeout: 10000 });
+
+  // Confirm the reset landed before trusting the new password. The page leaves /app/action
+  // on success; a lingering action URL means it did not take.
+  const changed = await page.waitForURL((url) => !url.toString().includes('/app/action'), { timeout: 20000 })
+    .then(() => true).catch(() => false);
+  if (!changed) {
+    throw new Error(`Password change not confirmed; still at ${page.url()} (new password: ${newPassword})`);
+  }
+
+  // Persist only once the change is confirmed, so column G never holds a password that was
+  // never actually set.
+  await updatePassword(rowIndex, newPassword);
+
+  step('reset — sign in with new password');
+  // ElevenLabs returns to the login form by itself once the password is changed, so stay on
+  // this page. Opening a second tab raced that redirect and left an unnavigated about:blank.
+  if (!page.url().includes('/app/sign-in')) {
+    await page.goto('https://elevenlabs.io/app/sign-in', { waitUntil: 'domcontentloaded' });
+  }
+  await page.waitForSelector('[data-testid="sign-in-email-input"]', { timeout: 20000 });
+  await page.waitForTimeout(1000);
+
+  const outcome = await attemptSignIn(page, email, newPassword);
+  if (outcome !== SIGN_IN.OK) {
+    throw new Error(`Sign-in still failed after password reset (${outcome})`);
+  }
+  await page.waitForTimeout(3000);
+
+  await finishOnboardingAndKey(page, rowIndex, email, newPassword);
+}
+
 // Picks up an account that already exists but has no key. Three states are possible and
 // they need different handling, so the sign-in outcome drives the branch:
 //   ok         - verified account, go straight to the key dialog
@@ -501,6 +649,7 @@ function parseArgs(argv) {
   const limitArg = argv.find((a) => a.startsWith('--limit='));
   const rowArg = argv.find((a) => a.startsWith('--row='));
   const resume = argv.includes('--resume');
+  const resetPassword = argv.includes('--reset-password');
   const limit = limitArg ? Number(limitArg.split('=')[1]) : Infinity;
   const row = rowArg ? Number(rowArg.split('=')[1]) : null;
   if (limitArg && (!Number.isInteger(limit) || limit < 1)) {
@@ -509,11 +658,11 @@ function parseArgs(argv) {
   if (rowArg && (!Number.isInteger(row) || row < 2)) {
     throw new Error(`--row must be a sheet row >= 2 (row 1 is the header), got: ${rowArg.split('=')[1]}`);
   }
-  return { limit, row, resume };
+  return { limit, row, resume, resetPassword };
 }
 
 async function run() {
-  const { limit, row, resume } = parseArgs(process.argv.slice(2));
+  const { limit, row, resume, resetPassword } = parseArgs(process.argv.slice(2));
 
   await initSheets();
 
@@ -521,7 +670,11 @@ async function run() {
   // ever captured. Returning these to 'pending' would not work - signup rejects the email
   // as already registered - so they are selected by content, not by status.
   let pendingRows;
-  if (resume) {
+  if (resetPassword) {
+    // Rows --resume gave up on: the account exists but the stored password does not open it.
+    pendingRows = (await loadRows()).filter((r) => r.status === 'credentials-rejected');
+    console.log(`Loaded ${pendingRows.length} account(s) needing a password reset`);
+  } else if (resume) {
     pendingRows = (await loadRows()).filter(
       (r) => r.status !== 'complete' && r.elevenPass && !r.apiKey,
     );
@@ -545,7 +698,8 @@ async function run() {
   }
 
   if (pendingRows.length === 0) {
-    console.log(resume ? 'No resumable accounts. Exiting.' : 'No pending accounts. Exiting.');
+    const what = resetPassword ? 'accounts needing a reset' : resume ? 'resumable accounts' : 'pending accounts';
+    console.log(`No ${what}. Exiting.`);
     return;
   }
 
@@ -580,14 +734,16 @@ async function run() {
     });
 
     try {
-      // Both paths write the success row themselves via updateResult.
-      await (resume ? resumeAccount(ctx, cred) : processAccount(ctx, cred));
+      // Every path writes its own success row via updateResult.
+      if (resetPassword) await resetPasswordAndCreateKey(ctx, cred);
+      else if (resume) await resumeAccount(ctx, cred);
+      else await processAccount(ctx, cred);
     } catch (err) {
       console.error(`\n❌ FAILED [${cred.email}] at step: ${currentStep}`);
       console.error(err.stack || err.message);
 
       // Classify failure: MS login steps = account inactive/bad creds
-      const isInactive = !resume && currentStep.startsWith('MS login');
+      const isInactive = !resume && !resetPassword && currentStep.startsWith('MS login');
       const failStatus = isInactive ? 'inactive' : `failed:${currentStep}`;
 
       // Status column only. Never blank F/G here: the ElevenLabs account may already exist
