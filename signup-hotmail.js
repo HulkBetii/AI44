@@ -340,9 +340,33 @@ async function grantAllPermissions(page) {
 // unverified one needs its mailbox, and rejected credentials cannot be recovered here.
 const SIGN_IN = { OK: 'ok', UNVERIFIED: 'unverified', REJECTED: 'rejected' };
 
+// Promise.race settles on the first promise to *settle*, and a rejection settles too - so a
+// branch that fails fast would otherwise beat a slower success. Losing branches drop out of
+// the race entirely; only a positive outcome or the overall timeout can decide it.
+function firstOutcome(candidates, timeoutMs) {
+  const NEVER = new Promise(() => {});
+  let timer;
+  const timeout = new Promise((resolve) => {
+    timer = setTimeout(() => resolve(null), timeoutMs);
+  });
+  return Promise.race([
+    ...candidates.map(({ promise, value }) => promise.then(() => value).catch(() => NEVER)),
+    timeout,
+  ]).finally(() => clearTimeout(timer));
+}
+
 async function attemptSignIn(page, email, elevenPassword) {
   step('sign in ElevenLabs');
-  await page.waitForSelector('[data-testid="sign-in-email-input"]', { timeout: 15000 });
+
+  const formShown = await page.waitForSelector('[data-testid="sign-in-email-input"]', { timeout: 15000 })
+    .then(() => true).catch(() => false);
+  if (!formShown) {
+    // No form, and the URL has left the sign-in route: an existing session was reused and
+    // the app went straight through. Nothing to submit.
+    if (!page.url().includes('/sign-in')) return SIGN_IN.OK;
+    throw new Error(`Sign-in form never appeared at ${page.url()}`);
+  }
+
   // Let hydration finish before typing - the signup step already does this.
   await page.waitForTimeout(800 + Math.random() * 500);
   await typeHuman(page, '[data-testid="sign-in-email-input"]', email);
@@ -351,15 +375,17 @@ async function attemptSignIn(page, email, elevenPassword) {
   await page.waitForTimeout(400);
   await page.click('[data-testid="sign-in-submit-button"]');
 
-  const left = page.waitForURL((url) => !url.toString().includes('/sign-in'), { timeout: 30000 })
-    .then(() => SIGN_IN.OK).catch(() => null);
-  // ElevenLabs keeps the URL on /sign-in for both of these, so match on the message.
-  const unverified = page.getByText('verification link', { exact: false })
-    .waitFor({ timeout: 30000 }).then(() => SIGN_IN.UNVERIFIED).catch(() => null);
-  const rejected = page.getByText('No user is found', { exact: false })
-    .waitFor({ timeout: 30000 }).then(() => SIGN_IN.REJECTED).catch(() => null);
+  const SETTLE_MS = 30000;
+  const outcome = await firstOutcome([
+    { value: SIGN_IN.OK,
+      promise: page.waitForURL((url) => !url.toString().includes('/sign-in'), { timeout: SETTLE_MS }) },
+    // ElevenLabs keeps the URL on /sign-in for both of these, so match on the message.
+    { value: SIGN_IN.UNVERIFIED,
+      promise: page.getByText('verification link', { exact: false }).waitFor({ timeout: SETTLE_MS }) },
+    { value: SIGN_IN.REJECTED,
+      promise: page.getByText('No user is found', { exact: false }).waitFor({ timeout: SETTLE_MS }) },
+  ], SETTLE_MS);
 
-  const outcome = await Promise.race([left, unverified, rejected]);
   if (!outcome) {
     const shown = await page.locator('[data-testid="sign-in-email-input"]')
       .inputValue().catch(() => '<no field>');
@@ -608,6 +634,34 @@ ${'═'.repeat(60)}`);
   await finishOnboardingAndKey(page, rowIndex, email, newPassword);
 }
 
+// Mints a fresh key on an account that already works, for rows whose original key was
+// created before permissions were granted explicitly. Signs in with the stored password;
+// no mailbox and no CAPTCHA are involved. The previous key stays live on the account -
+// column F simply stops pointing at it.
+async function regenerateAccountKey(ctx, cred) {
+  const { rowIndex, email, elevenPass } = cred;
+
+  console.log(`
+${'='.repeat(60)}`);
+  console.log(`> RE-KEY ${email} (sheet row ${rowIndex})`);
+  console.log(`${'='.repeat(60)}`);
+
+  step('re-key - open sign-in');
+  const page = await ctx.newPage();
+  activePage = page;
+  await page.goto('https://elevenlabs.io/app/sign-in', { waitUntil: 'domcontentloaded' });
+
+  const outcome = await attemptSignIn(page, email, elevenPass);
+  if (outcome !== SIGN_IN.OK) {
+    throw new Error(`Cannot sign in to re-key (${outcome})`);
+  }
+  await page.waitForTimeout(3000);
+
+  // Onboarding is already done for these accounts; every step in there is optional and
+  // no-ops when its control is absent.
+  await finishOnboardingAndKey(page, rowIndex, email, elevenPass);
+}
+
 // Picks up an account that already exists but has no key. Three states are possible and
 // they need different handling, so the sign-in outcome drives the branch:
 //   ok         - verified account, go straight to the key dialog
@@ -680,6 +734,8 @@ function parseArgs(argv) {
   const rowArg = argv.find((a) => a.startsWith('--row='));
   const resume = argv.includes('--resume');
   const resetPassword = argv.includes('--reset-password');
+  const regenerateKey = argv.includes('--regenerate-key');
+  const rowsArg = argv.find((a) => a.startsWith('--rows='));
   const limit = limitArg ? Number(limitArg.split('=')[1]) : Infinity;
   const row = rowArg ? Number(rowArg.split('=')[1]) : null;
   if (limitArg && (!Number.isInteger(limit) || limit < 1)) {
@@ -688,11 +744,22 @@ function parseArgs(argv) {
   if (rowArg && (!Number.isInteger(row) || row < 2)) {
     throw new Error(`--row must be a sheet row >= 2 (row 1 is the header), got: ${rowArg.split('=')[1]}`);
   }
-  return { limit, row, resume, resetPassword };
+  let rows = null;
+  if (rowsArg) {
+    rows = rowsArg.split('=')[1].split(',').map((n) => Number(n.trim()));
+    if (rows.some((n) => !Number.isInteger(n) || n < 2)) {
+      throw new Error(`--rows must be sheet rows >= 2 (row 1 is the header), got: ${rowsArg.split('=')[1]}`);
+    }
+  }
+  if (regenerateKey && !rows) {
+    throw new Error('--regenerate-key needs --rows=<n,n,...> naming the rows to re-key');
+  }
+
+  return { limit, row, rows, resume, resetPassword, regenerateKey };
 }
 
 async function run() {
-  const { limit, row, resume, resetPassword } = parseArgs(process.argv.slice(2));
+  const { limit, row, rows, resume, resetPassword, regenerateKey } = parseArgs(process.argv.slice(2));
 
   await initSheets();
 
@@ -700,7 +767,19 @@ async function run() {
   // ever captured. Returning these to 'pending' would not work - signup rejects the email
   // as already registered - so they are selected by content, not by status.
   let pendingRows;
-  if (resetPassword) {
+  if (regenerateKey) {
+    // Named explicitly: nothing in the sheet records how a key's permissions were granted,
+    // so which rows need re-keying is a judgement only the operator can make.
+    const all = await loadRows();
+    pendingRows = all.filter((r) => rows.includes(r.rowIndex));
+    const missing = rows.filter((n) => !pendingRows.some((r) => r.rowIndex === n));
+    if (missing.length) throw new Error(`No such row(s) in the sheet: ${missing.join(', ')}`);
+    const noPassword = pendingRows.filter((r) => !r.elevenPass);
+    if (noPassword.length) {
+      throw new Error(`Row(s) ${noPassword.map((r) => r.rowIndex).join(', ')} have no stored password to sign in with`);
+    }
+    console.log(`Re-keying ${pendingRows.length} account(s): rows ${rows.join(', ')}`);
+  } else if (resetPassword) {
     // Rows --resume gave up on: the account exists but the stored password does not open it.
     pendingRows = (await loadRows()).filter((r) => r.status === 'credentials-rejected');
     console.log(`Loaded ${pendingRows.length} account(s) needing a password reset`);
@@ -765,7 +844,8 @@ async function run() {
 
     try {
       // Every path writes its own success row via updateResult.
-      if (resetPassword) await resetPasswordAndCreateKey(ctx, cred);
+      if (regenerateKey) await regenerateAccountKey(ctx, cred);
+      else if (resetPassword) await resetPasswordAndCreateKey(ctx, cred);
       else if (resume) await resumeAccount(ctx, cred);
       else await processAccount(ctx, cred);
     } catch (err) {
@@ -773,7 +853,7 @@ async function run() {
       console.error(err.stack || err.message);
 
       // Classify failure: MS login steps = account inactive/bad creds
-      const isInactive = !resume && !resetPassword && currentStep.startsWith('MS login');
+      const isInactive = !resume && !resetPassword && !regenerateKey && currentStep.startsWith('MS login');
       const failStatus = isInactive ? 'inactive' : `failed:${currentStep}`;
 
       // Status column only. Never blank F/G here: the ElevenLabs account may already exist

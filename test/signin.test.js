@@ -9,6 +9,7 @@ const pick = (re) => src.match(re)[0];
 const bundle = [
   pick(/const SIGN_IN = \{[^}]*\};/),
   pick(/async function typeHuman\(page, selector, text\) \{[\s\S]*?\n\}/),
+  pick(/function firstOutcome\(candidates, timeoutMs\) \{[\s\S]*?\n\}/),
   pick(/async function attemptSignIn\(page, email, elevenPassword\) \{[\s\S]*?\n\}/),
   'return { attemptSignIn, SIGN_IN };',
 ].join('\n');
@@ -63,6 +64,18 @@ const url = (mode) =>
     assert.strictEqual(toggled, 0, 'typing must not hit the visibility toggle');
     assert.strictEqual(await page.locator('[data-testid="sign-in-password-input"]').inputValue(), 'Passw0rd!');
     console.log('✓ password typed in full; visibility toggle never intercepted');
+    await page.close();
+  }
+
+
+  // An already-authenticated context: /app/sign-in redirects into the app, so no form is
+  // rendered. This is what --regenerate-key hits, and it must read as success, not failure.
+  {
+    const page = await browser.newPage();
+    await page.goto(pathToFileURL(path.join(__dirname, 'fixtures', 'signin', 'home.html')).href);
+    const got = await attemptSignIn(page, 'test@example.com', 'Passw0rd!');
+    assert.strictEqual(got, SIGN_IN.OK, 'no form + off the sign-in route means already signed in');
+    console.log('✓ already-authenticated page reads as signed in');
     await page.close();
   }
 

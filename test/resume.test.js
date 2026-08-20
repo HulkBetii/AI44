@@ -6,13 +6,13 @@ const src = fs.readFileSync(path.join(__dirname, '..', 'signup-hotmail.js'), 'ut
 const parseArgs = new Function(
   `${src.match(/function parseArgs\(argv\) \{[\s\S]*?\n\}/)[0]}; return parseArgs;`)();
 
-assert.deepStrictEqual(parseArgs([]), { limit: Infinity, row: null, resume: false, resetPassword: false });
-assert.deepStrictEqual(parseArgs(['--resume']), { limit: Infinity, row: null, resume: true, resetPassword: false });
-assert.deepStrictEqual(parseArgs(['--resume', '--limit=2']), { limit: 2, row: null, resume: true, resetPassword: false });
+assert.deepStrictEqual(parseArgs([]), { limit: Infinity, row: null, rows: null, resume: false, resetPassword: false, regenerateKey: false });
+assert.deepStrictEqual(parseArgs(['--resume']), { limit: Infinity, row: null, rows: null, resume: true, resetPassword: false, regenerateKey: false });
+assert.deepStrictEqual(parseArgs(['--resume', '--limit=2']), { limit: 2, row: null, rows: null, resume: true, resetPassword: false, regenerateKey: false });
 console.log('✓ --resume parsed and combines with --limit');
 
 assert.deepStrictEqual(parseArgs(['--reset-password']),
-  { limit: Infinity, row: null, resume: false, resetPassword: true });
+  { limit: Infinity, row: null, rows: null, resume: false, resetPassword: true, regenerateKey: false });
 console.log('✓ --reset-password parsed');
 
 // Rows --resume gave up on are exactly what --reset-password should pick up.
