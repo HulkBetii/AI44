@@ -1,10 +1,62 @@
 const { chromium } = require('playwright');
-const fs = require('fs');
+const { google } = require('googleapis');
 const path = require('path');
 
-const HOTMAIL_FILE = 'C:\\Users\\HulkBeoti\\Documents\\hotmail.txt';
-const ACCOUNTS_FILE = path.join(__dirname, 'accounts.json');
 const FAILURE_SCREENSHOT = path.join(__dirname, 'debug-failure.png');
+
+// ── Google Sheets config ──────────────────────────────────────────────────────
+const SHEET_ID = '1nNAzzC34zSvX2S_AJ4jB6njhKnKRWs8KeZ0mJ5oSkTU';
+const SHEET_NAME = 'hotmail';
+// Columns (1-indexed): A=email B=password C=msaToken D=tenantGuid E=recoveryEmail
+//                      F=elevenLabsApiKey G=elevenLabsPassword H=status
+const COL = { email:0, password:1, msaToken:2, tenantGuid:3, recoveryEmail:4,
+              apiKey:5, elevenPass:6, status:7 };
+
+let sheetsClient = null;
+
+async function initSheets() {
+  const key = require('./service-account.json');
+  const auth = new google.auth.GoogleAuth({
+    credentials: key,
+    scopes: ['https://www.googleapis.com/auth/spreadsheets'],
+  });
+  sheetsClient = google.sheets({ version: 'v4', auth });
+}
+
+// Returns array of { rowIndex (1-based, header=1), email, password, ... }
+async function loadPendingRows() {
+  const res = await sheetsClient.spreadsheets.values.get({
+    spreadsheetId: SHEET_ID,
+    range: `${SHEET_NAME}!A:H`,
+  });
+  const rows = res.data.values || [];
+  const pending = [];
+  for (let i = 1; i < rows.length; i++) {  // skip header row (i=0)
+    const r = rows[i];
+    const status = (r[COL.status] || '').trim().toLowerCase();
+    if (status !== 'pending') continue;
+    pending.push({
+      rowIndex: i + 1,  // Sheet rows are 1-based, header at row 1
+      email: r[COL.email] || '',
+      password: r[COL.password] || '',
+      msaToken: r[COL.msaToken] || '',
+      tenantGuid: r[COL.tenantGuid] || '',
+      recoveryEmail: r[COL.recoveryEmail] || '',
+    });
+  }
+  return pending;
+}
+
+// Writes apiKey, elevenPass, status back to the row in Sheet
+async function updateSheetRow(rowIndex, apiKey, elevenPass, status) {
+  await sheetsClient.spreadsheets.values.update({
+    spreadsheetId: SHEET_ID,
+    range: `${SHEET_NAME}!F${rowIndex}:H${rowIndex}`,
+    valueInputOption: 'RAW',
+    requestBody: { values: [[apiKey, elevenPass, status]] },
+  });
+  console.log(`[sheet] Row ${rowIndex} updated → status: ${status}`);
+}
 
 const MS_OAUTH_URL =
   'https://login.microsoftonline.com/organizations/oauth2/v2.0/authorize' +
@@ -40,41 +92,7 @@ function step(name) {
   console.log(`[step] ${name}`);
 }
 
-// ── Persistence ──────────────────────────────────────────────────────────────
-function saveAccount(record) {
-  const accounts = fs.existsSync(ACCOUNTS_FILE)
-    ? JSON.parse(fs.readFileSync(ACCOUNTS_FILE, 'utf8'))
-    : [];
-  const id = accounts.reduce((max, a) => Math.max(max, a.id ?? 0), 0) + 1;
-  accounts.push({ id, ...record, createdAt: new Date().toISOString() });
-  fs.writeFileSync(ACCOUNTS_FILE, JSON.stringify(accounts, null, 2));
-  console.log(`[✓] Account #${id} saved to accounts.json`);
-  return id;
-}
-
-// ── Parse hotmail.txt ────────────────────────────────────────────────────────
-// Line format (after "N. " prefix):
-//   email|password|msaToken|tenantGuid|recoveryEmail
-function parseHotmailFile(filePath) {
-  const raw = fs.readFileSync(filePath, 'utf8');
-  const accounts = [];
-  for (const line of raw.split('\n')) {
-    const trimmed = line.trim();
-    // Lines look like: "1. email@hotmail.com|password|token|guid|recovery@..."
-    const match = trimmed.match(/^\d+\.\s+(.+)$/);
-    if (!match) continue;
-    const parts = match[1].split('|');
-    if (parts.length < 5) continue;
-    accounts.push({
-      email: parts[0].trim(),
-      password: parts[1].trim(),
-      msaToken: parts[2].trim(),
-      tenantGuid: parts[3].trim(),
-      recoveryEmail: parts[4].trim(),
-    });
-  }
-  return accounts;
-}
+// (account persistence moved to Google Sheets via updateSheetRow)
 
 // ── Human-like typing ────────────────────────────────────────────────────────
 async function typeHuman(page, selector, text) {
@@ -124,7 +142,14 @@ async function loginMicrosoft(hotmailEmail, hotmailPassword) {
   await typeHuman(loginPage, '#passwordEntry', hotmailPassword);
   await loginPage.waitForTimeout(500 + Math.random() * 300);
 
-  // Click "No" (don't stay signed in prompt)
+  // Click Next to submit password
+  step('MS login — submit password');
+  await loginPage.click('button[type="submit"][data-testid="primaryButton"]:has-text("Next")');
+  await loginPage.waitForTimeout(1000 + Math.random() * 500);
+
+  // Click "No" on "Stay signed in?" prompt
+  step('MS login — click No (stay signed in)');
+  await loginPage.waitForSelector('button[type="submit"][data-testid="secondaryButton"]:has-text("No")', { timeout: 15000 });
   await loginPage.click('button[type="submit"][data-testid="secondaryButton"]:has-text("No")');
 
   // Wait for redirect into Outlook inbox
@@ -175,7 +200,7 @@ async function pollOutlookInbox(outookPage, timeoutMs = INBOX_TIMEOUT_MS) {
 
 // ── Process one hotmail account end-to-end ───────────────────────────────────
 async function processAccount(cred) {
-  const { email: hotmailEmail, password: hotmailPassword, recoveryEmail } = cred;
+  const { rowIndex, email: hotmailEmail, password: hotmailPassword, recoveryEmail } = cred;
   const elevenPassword = generatePassword();
 
   console.log(`\n${'═'.repeat(60)}`);
@@ -330,16 +355,9 @@ async function processAccount(cred) {
   console.log(`[9] API Key: ${apiKey}`);
   console.log(`\n✅ Done: ${hotmailEmail} | ${elevenPassword} | ${apiKey}`);
 
-  saveAccount({
-    email: hotmailEmail,
-    password: elevenPassword,
-    hotmailPassword,
-    recoveryEmail,
-    apiKey,
-    apiKeyName: keyName,
-    firstName,
-    status: 'complete',
-  });
+  // Write results back to Google Sheet
+  await updateSheetRow(rowIndex, apiKey, elevenPassword, 'complete');
+  console.log(`\n✅ Done: ${hotmailEmail} | ${elevenPassword} | ${apiKey}`);
 
   // Close this account's tabs; browser stays open for the next account
   await signupPage.close().catch(() => {});
@@ -349,8 +367,14 @@ async function processAccount(cred) {
 
 // ── Main loop ────────────────────────────────────────────────────────────────
 async function run() {
-  const hotmailAccounts = parseHotmailFile(HOTMAIL_FILE);
-  console.log(`Loaded ${hotmailAccounts.length} accounts from hotmail.txt`);
+  await initSheets();
+  const pendingRows = await loadPendingRows();
+  console.log(`Loaded ${pendingRows.length} pending accounts from Google Sheet`);
+
+  if (pendingRows.length === 0) {
+    console.log('No pending accounts. Exiting.');
+    return;
+  }
 
   step('launch Chrome');
   context = await chromium.launchPersistentContext(PROFILE_DIR, {
@@ -371,28 +395,27 @@ async function run() {
     Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
   });
 
-  for (let i = 0; i < hotmailAccounts.length; i++) {
-    const cred = hotmailAccounts[i];
-    console.log(`\n[${i + 1}/${hotmailAccounts.length}] ${cred.email}`);
+  for (let i = 0; i < pendingRows.length; i++) {
+    const cred = pendingRows[i];
+    console.log(`\n[${i + 1}/${pendingRows.length}] ${cred.email} (sheet row ${cred.rowIndex})`);
 
     try {
       await processAccount(cred);
+      // processAccount calls updateSheetRow on success internally
     } catch (err) {
       console.error(`\n❌ FAILED [${cred.email}] at step: ${currentStep}`);
       console.error(err.stack || err.message);
 
-      saveAccount({
-        email: cred.email,
-        hotmailPassword: cred.password,
-        recoveryEmail: cred.recoveryEmail,
-        status: 'incomplete',
-        failedAt: currentStep,
-      });
+      // Classify failure: MS login steps = account inactive/bad creds
+      const isInactive = currentStep.startsWith('MS login');
+      const failStatus = isInactive ? 'inactive' : `failed:${currentStep}`;
+
+      await updateSheetRow(cred.rowIndex, '', '', failStatus).catch(() => {});
 
       if (activePage && !activePage.isClosed()) {
         try {
           await activePage.screenshot({ path: FAILURE_SCREENSHOT, fullPage: true });
-          console.error(`[debug] Screenshot saved.`);
+          console.error('[debug] Screenshot saved.');
         } catch (_) {}
       }
 
