@@ -24,7 +24,10 @@ function render() {
   const step = steps[i];
 
   if (step === 'platform') {
-    el.innerHTML = '<h1>Choose your platform</h1>' + advance('Continue');
+    el.innerHTML = '<h1>Choose your platform</h1>' +
+      '<button aria-label="ElevenCreative" aria-selected="true" data-agent-id="onboarding-platform-elevencreative">ElevenCreative</button>' +
+      '<button aria-label="ElevenAgents" aria-selected="false" data-agent-id="onboarding-platform-elevenagents">ElevenAgents</button>' +
+      advance('Continue');
   } else if (step === 'name') {
     // The real form: a Radix checkbox button wrapping .checkbox-hitarea, whose hidden input
     // is name="adult" - not "age", which is what the old selector looked for.
@@ -43,17 +46,22 @@ function render() {
     });
   } else if (step === 'role') {
     el.innerHTML = '<h1>Which one describes you the best?</h1>' +
-      '<button aria-label="Personal use">Personal use</button>' +
-      '<button aria-label="Creator">Creator</button>' +
-      '<button>Back</button>' + advance('Skip');
+      '<button aria-label="Personal use" data-agent-id="onboarding-icon-option-personal_use">Personal use</button>' +
+      '<button aria-label="Creator" data-agent-id="onboarding-icon-option-creator">Creator</button>' +
+      '<button aria-label="Engineer" data-agent-id="onboarding-icon-option-engineer">Engineer</button>' +
+      '<button data-agent-id="button-_r_4a_">Back</button>' + advance('Skip');
   } else if (step === 'interests') {
     el.innerHTML = '<h1>What would you like to do with ElevenLabs?</h1>' +
-      '<button aria-label="Text to speech">Text to speech</button>' +
-      '<button>Back</button>' + advance('Skip');
+      '<button aria-label="Text to speech" data-agent-id="onboarding-illustration-option-text-to-speech">Text to speech</button>' +
+      '<button aria-label="Music" data-agent-id="onboarding-illustration-option-music">Music</button>' +
+      '<button data-agent-id="button-_r_55_">Back</button>' + advance('Skip');
   } else if (step === 'pricing') {
+    // No survey option exists on this screen - every control is a paid-plan action.
     el.innerHTML = '<h1>Do more with ElevenLabs</h1>' +
-      '<button>Select plan</button><button>Select plan</button>' +
-      advance('Skip') + '<button>Explore all plans</button>';
+      '<button data-agent-id="button-_r_5q_">Select plan</button>' +
+      '<button data-agent-id="button-_r_65_">Select plan</button>' +
+      '<button data-agent-id="button-_r_6d_">Select plan</button>' +
+      advance('Skip') + '<button data-agent-id="button-_r_6s_">Explore all plans</button>';
   }
 
   document.getElementById('go').addEventListener('click', () => {

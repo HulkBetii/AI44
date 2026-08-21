@@ -2,15 +2,15 @@ const assert = require('assert');
 const fs = require('fs');
 const path = require('path');
 const { chromium } = require('playwright');
-const { clickHuman } = require('../human-behavior.js');
+const { clickHuman, think } = require('../human-behavior.js');
 
 const src = fs.readFileSync(path.join(__dirname, '..', 'signup-hotmail.js'), 'utf8');
 const fn = src.match(/async function pollOutlookInbox\([\s\S]*?\n\}/)[0];
 // dismissConsentDialog lives in signup-hotmail.js too; the fixture never shows the modal, so
 // a no-op stand-in is enough to satisfy the reference.
 const pollOutlookInbox = new Function(
-  'INBOX_TIMEOUT_MS', 'LIST_RENDER_TIMEOUT_MS', 'clickHuman', 'dismissConsentDialog',
-  `return ${fn}`)(20000, 20000, clickHuman, async () => false);
+  'INBOX_TIMEOUT_MS', 'LIST_RENDER_TIMEOUT_MS', 'clickHuman', 'dismissConsentDialog', 'think',
+  `return ${fn}`)(20000, 20000, clickHuman, async () => false, async () => {});
 
 // Mailbox holding BOTH an old verification mail and a newer reset mail - the exact situation
 // that made the old "take the first ElevenLabs message" logic return the wrong link.

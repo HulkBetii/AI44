@@ -9,17 +9,35 @@ const gpm = require('./gpm-api');
 
 const FAILURE_SCREENSHOT = path.join(__dirname, 'debug-failure.png');
 const SUCCESS_CSV = path.join(__dirname, 'success_accounts.csv');
+const KEYS_TXT = path.join(__dirname, 'keys.txt');
+const Q = String.fromCharCode(34);
 
-function appendSuccessCSV(cred, elevenPassword, apiKey, proxyString) {
-  const fileExists = fs.existsSync(SUCCESS_CSV);
-  if (!fileExists) {
-    fs.writeFileSync(SUCCESS_CSV, 'Timestamp,Email,HotmailPassword,ElevenPassword,RecoveryEmail,APIKey,Proxy\n', 'utf8');
-  }
-  const timestamp = new Date().toISOString();
-  const row = `${timestamp},${cred.email},${cred.password},${elevenPassword},${cred.recoveryEmail || ''},${apiKey},${proxyString}\n`;
-  fs.appendFileSync(SUCCESS_CSV, row, 'utf8');
+// Hotmail passwords and recovery addresses come from the operator's sheet, so their
+// contents are arbitrary: one comma would shift every later column and corrupt the
+// record silently.
+function csvCell(value) {
+  return Q + String(value ?? '').split(Q).join(Q + Q) + Q;
 }
 
+function appendSuccessCSV(cred, elevenPassword, apiKey, proxyString) {
+  if (!fs.existsSync(SUCCESS_CSV)) {
+    fs.writeFileSync(SUCCESS_CSV,
+      'Timestamp,Email,HotmailPassword,ElevenPassword,RecoveryEmail,APIKey,Proxy\n', 'utf8');
+  }
+  const row = [
+    new Date().toISOString(), cred.email, cred.password,
+    elevenPassword, cred.recoveryEmail, apiKey, proxyString,
+  ].map(csvCell).join(',') + '\n';
+  fs.appendFileSync(SUCCESS_CSV, row, 'utf8');
+  
+  if (apiKey) {
+    fs.appendFileSync(KEYS_TXT, apiKey + '\n', 'utf8');
+  }
+}
+
+
+const SURVEY_OPTION_SELECTOR =
+  '[data-agent-id^="onboarding-icon-option-"], [data-agent-id^="onboarding-illustration-option-"]';
 
 const LOGIN_URL = 'https://login.live.com/';
 
@@ -199,7 +217,8 @@ async function dismissConsentDialog(page) {
 
 // ── Poll Outlook inbox via DOM ────────────────────────────────────────────────
 async function pollOutlookInbox(outookPage, timeoutMs = INBOX_TIMEOUT_MS, mode = 'verifyEmail') {
-  step('poll Outlook inbox for verify email (thinking...)');
+  // No step() here: the resume and reset paths set a more specific label immediately before
+  // calling this, and that label is what lands in the sheet's status column.
   await think(3000, 7000); // Tầng 4: Nhịp thở tự nhiên khi nhận OTP
 
   const start = Date.now();
@@ -478,21 +497,24 @@ Last seen: ${lastSeen}`);
     // Tầng 4: Nhịp thở tự nhiên (Thinking Time) khi quan sát giao diện mới
     await think(1200, 3800);
 
-    // Tầng 4: Randomized Action Graph - Chọn ngẫu nhiên survey thay vì luôn Skip
+    // Tầng 4: Randomized Action Graph - Chọn ngẫu nhiên survey thay vì luôn Skip.
+    // Matched by the ids ElevenLabs gives its answer tiles, not by excluding navigation text:
+    // an exclusion list left "Select plan" as the only candidate on the pricing screen and
+    // left "Back" selectable on both question screens. Those controls carry generic
+    // button-_r_* ids, so matching the semantic prefixes rules them out structurally.
     if (Math.random() < 0.70) {
-      // Tìm các button không phải là nút điều hướng (khả năng cao là các lựa chọn khảo sát)
-      const surveyOptions = page.locator('button, [role="radio"], [role="checkbox"]').filter({
-        hasNotText: /^(Continue|Next|Skip|Get started|Got it)$/i
-      });
+      const surveyOptions = page.locator(SURVEY_OPTION_SELECTOR);
       const optCount = await surveyOptions.count().catch(() => 0);
-      
-      // Nếu màn hình có nhiều lựa chọn, click ngẫu nhiên 1 lựa chọn
-      if (optCount > 2 && optCount < 20) {
+
+      if (optCount > 0) {
         const randIdx = Math.floor(Math.random() * optCount);
         const opt = surveyOptions.nth(randIdx);
         if (await opt.isVisible().catch(() => false)) {
-          console.log(`[onboarding] Phân tán hành vi: click random option ${randIdx}/${optCount}`);
-          await clickHuman(page, opt).catch(() => {});
+          const label = await opt.getAttribute('aria-label').catch(() => null);
+          console.log(`[onboarding] Phân tán hành vi: chọn "${label || randIdx}" (${optCount} lựa chọn)`);
+          await clickHuman(page, opt).catch((e) => {
+            console.warn(`[onboarding] random option click failed: ${e.message}`);
+          });
           await think(800, 1500);
         }
       }
@@ -893,7 +915,7 @@ function parseArgs(argv) {
   if (rowArg && (!Number.isInteger(row) || row < 2)) {
     throw new Error(`--row must be a sheet row >= 2 (row 1 is the header), got: ${rowArg.split('=')[1]}`);
   }
-  if (intervalArg && (isNaN(interval) || interval < 0)) {
+  if (intervalArg && (!Number.isFinite(interval) || interval <= 0)) {
     throw new Error(`--interval must be a positive number, got: ${intervalArg.split('=')[1]}`);
   }
 
@@ -993,6 +1015,12 @@ async function run() {
     // Reset before the try: otherwise a throw raised before this account's first step() call
     // would be attributed to the previous account's last step.
     currentStep = 'account start';
+
+    // loadRows fills apiKey from column F, so a row that already had a key would otherwise
+    // look successful even when this run failed - a failed --regenerate-key wrote a CSV entry
+    // carrying the stale key and an undefined password. Only this run may set these.
+    cred.apiKey = null;
+    cred.elevenPassword = null;
 
     // One context per account. A fresh context drops cookies, localStorage and IndexedDB, so
     // the previous account's Microsoft session cannot leak into this login. Closing it also
@@ -1105,7 +1133,18 @@ async function run() {
     if (i < pendingRows.length - 1) {
       const delayMs = poissonIntervalDelay(interval);
       console.log(`\n[Anti-Graph] Đợi ${Math.round(delayMs / 1000)}s trước khi chạy tài khoản tiếp theo...`);
-      await new Promise(r => setTimeout(r, delayMs));
+
+      // A silent multi-minute setTimeout is indistinguishable from a hang, which is why
+      // the CAPTCHA wait ticks. Same answer here for anything over a minute.
+      const until = Date.now() + delayMs;
+      const ticker = delayMs > 60000
+        ? setInterval(() => console.log(`   …còn ${Math.round((until - Date.now()) / 1000)}s`), 30000)
+        : null;
+      try {
+        await new Promise((r) => setTimeout(r, delayMs));
+      } finally {
+        if (ticker) clearInterval(ticker);
+      }
     }
   }
 

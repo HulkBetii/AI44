@@ -2,20 +2,24 @@ const assert = require('assert');
 const fs = require('fs');
 const path = require('path');
 const { chromium } = require('playwright');
-const { clickHuman, typeHuman, generateRealisticName } = require('../human-behavior.js');
+const { clickHuman, typeHuman, generateRealisticName, think } = require('../human-behavior.js');
 
 // The onboarding half of finishOnboardingAndKey, lifted out so it can be driven without the
 // API-key half (which needs a real ElevenLabs dialog).
 const src = fs.readFileSync(path.join(__dirname, '..', 'signup-hotmail.js'), 'utf8');
+const SURVEY_OPTION_SELECTOR = new Function(
+  `${src.match(/const SURVEY_OPTION_SELECTOR =[\s\S]*?;/)[0]} return SURVEY_OPTION_SELECTOR;`,
+)();
 const whole = src.match(/async function finishOnboardingAndKey\([\s\S]*?\n\}/)[0];
 const onboardingOnly = whole.slice(0, whole.indexOf('  // 9. Create API key')) + '\n}';
 // Two instances: a generous deadline for the real flows, and a short one for the case
 // meant to time out, so the suite does not sit waiting for it.
 const build = (deadlineMs) => new Function(
-  'step', 'clickHuman', 'typeHuman', 'generateRealisticName',
-  'ONBOARDING_TIMEOUT_MS', 'STEP_RENDER_TIMEOUT_MS',
+  'step', 'clickHuman', 'typeHuman', 'generateRealisticName', 'think',
+  'ONBOARDING_TIMEOUT_MS', 'STEP_RENDER_TIMEOUT_MS', 'SURVEY_OPTION_SELECTOR',
   `return ${onboardingOnly}`,
-)(() => {}, clickHuman, typeHuman, generateRealisticName, deadlineMs, 6000);
+)(() => {}, clickHuman, typeHuman, generateRealisticName, think, deadlineMs, 6000,
+  SURVEY_OPTION_SELECTOR);
 
 const finishOnboarding = build(60000);
 const finishOnboardingQuick = build(5000);
@@ -92,7 +96,12 @@ async function serveOnboarding(page, steps, splashMs = 0, asSpan = false) {
   {
     const page = await browser.newPage({ viewport: { width: 900, height: 600 } });
     await serveOnboarding(page, 'platform,role', 0, true);
-    assert.strictEqual(await page.locator('button').count(), 0, 'fixture must contain no <button>');
+    // The point is that the *advance* control is a bare span; the platform cards are still
+    // buttons, as they are on the real screen.
+    assert.strictEqual(
+      await page.getByRole('button', { name: 'Continue', exact: true }).count(), 0,
+      'fixture must render Continue as a span, not a button',
+    );
     await finishOnboarding(page, 1, 'a@example.com', 'pw');
     assert.ok(!page.url().includes('/app/onboarding'), `still on onboarding: ${page.url()}`);
     console.log('✓ advances a screen whose control is a bare span, not a <button>');

@@ -32,11 +32,14 @@ async function think(minMs = 1500, maxMs = 3500) {
  * @param {number} avgMinutes Thời gian trung bình (phút)
  * @returns {number} Thời gian trễ (mili-giây)
  */
-function poissonIntervalDelay(avgMinutes) {
+function poissonIntervalDelay(avgMinutes, maxMultiple = 3) {
   // -ln(1-u) * mean
   const u = Math.random();
-  const delayMs = -Math.log(1 - u) * avgMinutes * 60 * 1000;
-  return Math.max(1000, delayMs); // Tối thiểu 1 giây
+  const meanMs = avgMinutes * 60 * 1000;
+  const delayMs = -Math.log(1 - u) * meanMs;
+  // The exponential tail is unbounded: a draw of u=0.999 is ~7x the mean, which at
+  // --interval=5 would idle the batch for over half an hour. Keep the shape, cap the tail.
+  return Math.min(Math.max(1000, delayMs), meanMs * maxMultiple);
 }
 
 /**

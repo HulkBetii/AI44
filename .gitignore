@@ -6,3 +6,5 @@ debug-after-signup.png
 debug-failure*.png
 service-account.json
 hotmail.csv
+success_accounts.csv
+keys.txt

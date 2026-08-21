@@ -7,16 +7,16 @@ const src = fs.readFileSync(path.join(__dirname, '..', 'signup-hotmail.js'), 'ut
 const fn = src.match(/function parseArgs\(argv\) \{[\s\S]*?\n\}/)[0];
 const parseArgs = new Function(`${fn}; return parseArgs;`)();
 
-assert.deepStrictEqual(parseArgs([]), { limit: Infinity, row: null, rows: null, resume: false, resetPassword: false, regenerateKey: false, noProxy: false, proxyToken: null });
+assert.deepStrictEqual(parseArgs([]), { limit: Infinity, row: null, rows: null, resume: false, resetPassword: false, regenerateKey: false, noProxy: false, proxyToken: null, interval: 1 });
 console.log('✓ no flags → process everything');
 
-assert.deepStrictEqual(parseArgs(['--limit=2']), { limit: 2, row: null, rows: null, resume: false, resetPassword: false, regenerateKey: false, noProxy: false, proxyToken: null });
+assert.deepStrictEqual(parseArgs(['--limit=2']), { limit: 2, row: null, rows: null, resume: false, resetPassword: false, regenerateKey: false, noProxy: false, proxyToken: null, interval: 1 });
 console.log('✓ --limit=2 parsed');
 
-assert.deepStrictEqual(parseArgs(['--row=7']), { limit: Infinity, row: 7, rows: null, resume: false, resetPassword: false, regenerateKey: false, noProxy: false, proxyToken: null });
+assert.deepStrictEqual(parseArgs(['--row=7']), { limit: Infinity, row: 7, rows: null, resume: false, resetPassword: false, regenerateKey: false, noProxy: false, proxyToken: null, interval: 1 });
 console.log('✓ --row=7 parsed');
 
-assert.deepStrictEqual(parseArgs(['--row=7', '--limit=1']), { limit: 1, row: 7, rows: null, resume: false, resetPassword: false, regenerateKey: false, noProxy: false, proxyToken: null });
+assert.deepStrictEqual(parseArgs(['--row=7', '--limit=1']), { limit: 1, row: 7, rows: null, resume: false, resetPassword: false, regenerateKey: false, noProxy: false, proxyToken: null, interval: 1 });
 console.log('✓ flags combine');
 
 for (const bad of ['--limit=0', '--limit=-3', '--limit=abc', '--limit=1.5']) {
@@ -30,7 +30,7 @@ for (const bad of ['--row=1', '--row=0', '--row=xyz']) {
 console.log('✓ invalid --row rejected (header row, zero, non-numeric)');
 
 assert.deepStrictEqual(parseArgs(['--regenerate-key', '--rows=2,5,6']), {
-  limit: Infinity, row: null, rows: [2, 5, 6], resume: false, resetPassword: false, regenerateKey: true, noProxy: false, proxyToken: null,
+  limit: Infinity, row: null, rows: [2, 5, 6], resume: false, resetPassword: false, regenerateKey: true, noProxy: false, proxyToken: null, interval: 1,
 });
 console.log('✓ --regenerate-key with --rows parsed');
 
@@ -61,5 +61,16 @@ assert.throws(
   /mutually exclusive/,
 );
 console.log('✓ --no-proxy and --proxy-token together are rejected');
+
+assert.strictEqual(parseArgs(['--interval=5']).interval, 5);
+assert.strictEqual(parseArgs(['--interval=0.5']).interval, 0.5);
+console.log('✓ --interval parsed (fractional minutes allowed)');
+
+// The message says "positive number", so zero and empty must be rejected rather than
+// silently becoming 0 via Number('').
+for (const bad of ['--interval=0', '--interval=-2', '--interval=abc', '--interval=']) {
+  assert.throws(() => parseArgs([bad]), /--interval must be/, `should reject ${bad}`);
+}
+console.log('✓ invalid --interval rejected (zero, negative, non-numeric, empty)');
 
 console.log('\nAll assertions passed.');
