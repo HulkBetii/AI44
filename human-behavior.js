@@ -28,6 +28,18 @@ async function think(minMs = 1500, maxMs = 3500) {
 }
 
 /**
+ * Tính toán khoảng trễ theo Phân bố mũ (Exponential Distribution / Poisson Arrival Process)
+ * @param {number} avgMinutes Thời gian trung bình (phút)
+ * @returns {number} Thời gian trễ (mili-giây)
+ */
+function poissonIntervalDelay(avgMinutes) {
+  // -ln(1-u) * mean
+  const u = Math.random();
+  const delayMs = -Math.log(1 - u) * avgMinutes * 60 * 1000;
+  return Math.max(1000, delayMs); // Tối thiểu 1 giây
+}
+
+/**
  * Sinh quỹ đạo Cubic Bezier từ Start đến End
  */
 function generateBezierCurve(startX, startY, endX, endY, steps = 30) {
@@ -301,6 +313,7 @@ function generateRealisticName() {
 module.exports = {
   randomGaussian,
   think,
+  poissonIntervalDelay,
   clickHuman,
   typeHuman,
   smoothScroll,

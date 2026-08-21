@@ -1,5 +1,6 @@
 const { chromium } = require('playwright');
 const path = require('path');
+const fs = require('fs');
 const {
   initSheets, loadRows, loadPendingRows, updateStatus, updatePassword, updateResult,
 } = require('./sheets');
@@ -7,6 +8,18 @@ const { getNewProxyWithRetry, parseProxyString } = require('./proxy');
 const gpm = require('./gpm-api');
 
 const FAILURE_SCREENSHOT = path.join(__dirname, 'debug-failure.png');
+const SUCCESS_CSV = path.join(__dirname, 'success_accounts.csv');
+
+function appendSuccessCSV(cred, elevenPassword, apiKey, proxyString) {
+  const fileExists = fs.existsSync(SUCCESS_CSV);
+  if (!fileExists) {
+    fs.writeFileSync(SUCCESS_CSV, 'Timestamp,Email,HotmailPassword,ElevenPassword,RecoveryEmail,APIKey,Proxy\n', 'utf8');
+  }
+  const timestamp = new Date().toISOString();
+  const row = `${timestamp},${cred.email},${cred.password},${elevenPassword},${cred.recoveryEmail || ''},${apiKey},${proxyString}\n`;
+  fs.appendFileSync(SUCCESS_CSV, row, 'utf8');
+}
+
 
 const LOGIN_URL = 'https://login.live.com/';
 
@@ -28,7 +41,7 @@ function step(name) {
 }
 
 const { 
-  think, clickHuman, typeHuman, smoothScroll, generateRealisticName
+  think, clickHuman, typeHuman, smoothScroll, generateRealisticName, poissonIntervalDelay
 } = require('./human-behavior');
 
 function generatePassword() {
@@ -186,6 +199,9 @@ async function dismissConsentDialog(page) {
 
 // ── Poll Outlook inbox via DOM ────────────────────────────────────────────────
 async function pollOutlookInbox(outookPage, timeoutMs = INBOX_TIMEOUT_MS, mode = 'verifyEmail') {
+  step('poll Outlook inbox for verify email (thinking...)');
+  await think(3000, 7000); // Tầng 4: Nhịp thở tự nhiên khi nhận OTP
+
   const start = Date.now();
   const wanted = `mode=${mode}`;
   let checkJunkNext = false;
@@ -305,7 +321,7 @@ async function processAccount(ctx, cred) {
   await clickHuman(verifyPage, 'button:has-text("Continue")');
   await verifyPage.waitForTimeout(2000);
 
-  await signInAndCreateKey(verifyPage, rowIndex, hotmailEmail, elevenPassword);
+  await signInAndCreateKey(verifyPage, cred, elevenPassword);
 }
 
 // Grants every endpoint in the Create API Key dialog its most permissive setting.
@@ -417,19 +433,19 @@ async function attemptSignIn(page, email, elevenPassword) {
   return outcome;
 }
 
-async function signInAndCreateKey(page, rowIndex, email, elevenPassword) {
-  const outcome = await attemptSignIn(page, email, elevenPassword);
+async function signInAndCreateKey(page, cred, elevenPassword) {
+  const outcome = await attemptSignIn(page, cred.email, elevenPassword);
   if (outcome !== SIGN_IN.OK) {
     throw new Error(`Sign-in did not complete (${outcome}) at ${page.url()}`);
   }
   await page.waitForTimeout(3000);
 
-  await finishOnboardingAndKey(page, rowIndex, email, elevenPassword);
+  await finishOnboardingAndKey(page, cred, elevenPassword);
 }
 
 // Onboarding, key creation and the sheet write. Split out so --resume can reach it
 // without repeating the sign-up half of the pipeline.
-async function finishOnboardingAndKey(page, rowIndex, email, elevenPassword) {
+async function finishOnboardingAndKey(page, cred, elevenPassword) {
   // 8. Onboarding
   step('onboarding');
   const { firstName } = generateRealisticName();
@@ -458,6 +474,29 @@ Last seen: ${lastSeen}`);
     // nothing.
     await page.waitForFunction(() => document.body.innerText.trim().length > 0,
       { timeout: STEP_RENDER_TIMEOUT_MS }).catch(() => {});
+      
+    // Tầng 4: Nhịp thở tự nhiên (Thinking Time) khi quan sát giao diện mới
+    await think(1200, 3800);
+
+    // Tầng 4: Randomized Action Graph - Chọn ngẫu nhiên survey thay vì luôn Skip
+    if (Math.random() < 0.70) {
+      // Tìm các button không phải là nút điều hướng (khả năng cao là các lựa chọn khảo sát)
+      const surveyOptions = page.locator('button, [role="radio"], [role="checkbox"]').filter({
+        hasNotText: /^(Continue|Next|Skip|Get started|Got it)$/i
+      });
+      const optCount = await surveyOptions.count().catch(() => 0);
+      
+      // Nếu màn hình có nhiều lựa chọn, click ngẫu nhiên 1 lựa chọn
+      if (optCount > 2 && optCount < 20) {
+        const randIdx = Math.floor(Math.random() * optCount);
+        const opt = surveyOptions.nth(randIdx);
+        if (await opt.isVisible().catch(() => false)) {
+          console.log(`[onboarding] Phân tán hành vi: click random option ${randIdx}/${optCount}`);
+          await clickHuman(page, opt).catch(() => {});
+          await think(800, 1500);
+        }
+      }
+    }
 
     // The age confirmation is a Radix checkbox: the hidden input is name="adult" (not "age"),
     // and the thing that takes the click is the button, which wraps a .checkbox-hitarea.
@@ -587,8 +626,13 @@ Last seen: ${lastSeen}`);
 
   // Write results back to Google Sheet. If this throws, the caller marks the row failed
   // but leaves F/G alone - and the key is on stdout above, so it is not lost silently.
-  await updateResult(rowIndex, apiKey, elevenPassword, 'complete');
-  console.log(`\n✅ Done: ${email} | ${elevenPassword} | ${apiKey}`);
+  await updateResult(cred.rowIndex, apiKey, elevenPassword, 'complete');
+  
+  cred.apiKey = apiKey;
+  cred.elevenPassword = elevenPassword;
+
+  console.log(`\n✅ Done: ${cred.email} | ${elevenPassword} | ${apiKey}`);
+  return apiKey;
 }
 
 // Returns the first selector that exists on the page. Used where the exact markup has not
@@ -730,7 +774,7 @@ ${'═'.repeat(60)}`);
   }
   await page.waitForTimeout(3000);
 
-  await finishOnboardingAndKey(page, rowIndex, email, newPassword);
+  await finishOnboardingAndKey(page, cred, newPassword);
 }
 
 // Mints a fresh key on an account that already works, for rows whose original key was
@@ -758,7 +802,7 @@ ${'='.repeat(60)}`);
 
   // Onboarding is already done for these accounts; every step in there is optional and
   // no-ops when its control is absent.
-  await finishOnboardingAndKey(page, rowIndex, email, elevenPass);
+  await finishOnboardingAndKey(page, cred, elevenPass);
 }
 
 // Picks up an account that already exists but has no key. Three states are possible and
@@ -817,12 +861,12 @@ ${'═'.repeat(60)}`);
     }
     await page.waitForTimeout(3000);
 
-    await finishOnboardingAndKey(page, rowIndex, email, elevenPass);
+    await finishOnboardingAndKey(page, cred, elevenPass);
     return;
   }
 
   await page.waitForTimeout(3000);
-  await finishOnboardingAndKey(page, rowIndex, email, elevenPass);
+  await finishOnboardingAndKey(page, cred, elevenPass);
 }
 
 // ── Main loop ────────────────────────────────────────────────────────────────
@@ -840,12 +884,19 @@ function parseArgs(argv) {
   const rowsArg = argv.find((a) => a.startsWith('--rows='));
   const limit = limitArg ? Number(limitArg.split('=')[1]) : Infinity;
   const row = rowArg ? Number(rowArg.split('=')[1]) : null;
+  const intervalArg = argv.find((a) => a.startsWith('--interval='));
+  const interval = intervalArg ? Number(intervalArg.split('=')[1]) : 1; // Mặc định 1 phút
+
   if (limitArg && (!Number.isInteger(limit) || limit < 1)) {
     throw new Error(`--limit must be a positive integer, got: ${limitArg.split('=')[1]}`);
   }
   if (rowArg && (!Number.isInteger(row) || row < 2)) {
     throw new Error(`--row must be a sheet row >= 2 (row 1 is the header), got: ${rowArg.split('=')[1]}`);
   }
+  if (intervalArg && (isNaN(interval) || interval < 0)) {
+    throw new Error(`--interval must be a positive number, got: ${intervalArg.split('=')[1]}`);
+  }
+
   let rows = null;
   if (rowsArg) {
     rows = rowsArg.split('=')[1].split(',').map((n) => Number(n.trim()));
@@ -861,11 +912,11 @@ function parseArgs(argv) {
     throw new Error('--no-proxy and --proxy-token are mutually exclusive');
   }
 
-  return { limit, row, rows, resume, resetPassword, regenerateKey, noProxy, proxyToken };
+  return { limit, row, rows, resume, resetPassword, regenerateKey, noProxy, proxyToken, interval };
 }
 
 async function run() {
-  const { limit, row, rows, resume, resetPassword, regenerateKey, noProxy, proxyToken } = parseArgs(process.argv.slice(2));
+  const { limit, row, rows, resume, resetPassword, regenerateKey, noProxy, proxyToken, interval } = parseArgs(process.argv.slice(2));
 
   await initSheets();
 
@@ -1043,6 +1094,18 @@ async function run() {
           .then(() => console.log(`[GPM] Profile ${gpmProfileId} deleted.`))
           .catch((e) => console.warn(`[GPM] DELETE FAILED for ${gpmProfileId}: ${e.message} - profile folder left on disk`));
       }
+    }
+
+    // Tầng 4: Export tài khoản thành công ra CSV
+    if (cred.apiKey) {
+      appendSuccessCSV(cred, cred.elevenPassword, cred.apiKey, proxyString);
+    }
+
+    // Tầng 4: Phân bố Poisson - Delay ngẫu nhiên giữa các luồng
+    if (i < pendingRows.length - 1) {
+      const delayMs = poissonIntervalDelay(interval);
+      console.log(`\n[Anti-Graph] Đợi ${Math.round(delayMs / 1000)}s trước khi chạy tài khoản tiếp theo...`);
+      await new Promise(r => setTimeout(r, delayMs));
     }
   }
 
