@@ -6,13 +6,13 @@ const src = fs.readFileSync(path.join(__dirname, '..', 'signup-hotmail.js'), 'ut
 const parseArgs = new Function(
   `${src.match(/function parseArgs\(argv\) \{[\s\S]*?\n\}/)[0]}; return parseArgs;`)();
 
-assert.deepStrictEqual(parseArgs([]), { limit: Infinity, row: null, rows: null, resume: false, resetPassword: false, regenerateKey: false });
-assert.deepStrictEqual(parseArgs(['--resume']), { limit: Infinity, row: null, rows: null, resume: true, resetPassword: false, regenerateKey: false });
-assert.deepStrictEqual(parseArgs(['--resume', '--limit=2']), { limit: 2, row: null, rows: null, resume: true, resetPassword: false, regenerateKey: false });
+assert.deepStrictEqual(parseArgs([]), { limit: Infinity, row: null, rows: null, resume: false, resetPassword: false, regenerateKey: false, noProxy: false, proxyToken: null });
+assert.deepStrictEqual(parseArgs(['--resume']), { limit: Infinity, row: null, rows: null, resume: true, resetPassword: false, regenerateKey: false, noProxy: false, proxyToken: null });
+assert.deepStrictEqual(parseArgs(['--resume', '--limit=2']), { limit: 2, row: null, rows: null, resume: true, resetPassword: false, regenerateKey: false, noProxy: false, proxyToken: null });
 console.log('✓ --resume parsed and combines with --limit');
 
 assert.deepStrictEqual(parseArgs(['--reset-password']),
-  { limit: Infinity, row: null, rows: null, resume: false, resetPassword: true, regenerateKey: false });
+  { limit: Infinity, row: null, rows: null, resume: false, resetPassword: true, regenerateKey: false, noProxy: false, proxyToken: null });
 console.log('✓ --reset-password parsed');
 
 // Rows --resume gave up on are exactly what --reset-password should pick up.
@@ -44,3 +44,11 @@ console.log('  - skips rows that never got past Microsoft login');
 console.log('  - skips rows that already hold a key');
 
 console.log('\nAll assertions passed.');
+
+// --no-proxy must override BOTH the global fallback token and a per-row token - it exists
+// specifically to isolate "is the proxy causing this" during diagnosis, so it must be total.
+const activeToken = (noProxy, cred, defaultToken) => (noProxy ? null : (cred.proxyToken || defaultToken));
+assert.strictEqual(activeToken(true, { proxyToken: 'row-token' }, 'default-token'), null);
+assert.strictEqual(activeToken(false, { proxyToken: 'row-token' }, 'default-token'), 'row-token');
+assert.strictEqual(activeToken(false, { proxyToken: '' }, 'default-token'), 'default-token');
+console.log('✓ --no-proxy overrides both per-row and fallback proxy tokens');

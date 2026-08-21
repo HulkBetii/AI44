@@ -3,6 +3,8 @@ const path = require('path');
 const {
   initSheets, loadRows, loadPendingRows, updateStatus, updatePassword, updateResult,
 } = require('./sheets');
+const { getNewProxyWithRetry, parseProxyString } = require('./proxy');
+const gpm = require('./gpm-api');
 
 const FAILURE_SCREENSHOT = path.join(__dirname, 'debug-failure.png');
 
@@ -22,37 +24,17 @@ function step(name) {
   console.log(`[step] ${name}`);
 }
 
-// ── Human-like typing ────────────────────────────────────────────────────────
-async function typeHuman(page, selector, text) {
-  // Attach the URL: a field that vanishes mid-flow means the page navigated under us, and
-  // the bare Playwright timeout does not say where we ended up.
-  await page.click(selector).catch((e) => {
-    throw new Error(`${e.message.split('\n')[0]} (page is at ${page.url()})`);
-  });
-  await page.fill(selector, '');
-  for (const char of text) {
-    await page.keyboard.type(char, { delay: 50 + Math.random() * 80 });
-  }
-
-  // A React re-render mid-typing silently drops the remaining characters, which previously
-  // produced a truncated email and a sign-in that failed three steps later. Verify and repair.
-  const landed = await page.inputValue(selector);
-  if (landed !== text) {
-    console.warn(`[type] field truncated (${landed.length}/${text.length} chars) - repairing`);
-    await page.fill(selector, text);
-    const repaired = await page.inputValue(selector);
-    if (repaired !== text) {
-      throw new Error(`Could not set ${selector}: wanted ${text.length} chars, field holds ${repaired.length}`);
-    }
-  }
-}
+const { 
+  think, clickHuman, typeHuman, smoothScroll, generateRealisticName
+} = require('./human-behavior');
 
 function generatePassword() {
-  const letters = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ';
-  const numbers = '0123456789';
-  const specials = '!@#$%^&*';
-  const rand = (str) => str[Math.floor(Math.random() * str.length)];
-  return Array.from({ length: 6 }, () => rand(letters)).join('') + rand(numbers) + rand(specials);
+  const { firstName } = generateRealisticName();
+  const words = ['Love', 'Life', 'Star', 'Moon', 'Sky', 'Blue', 'Green', 'Happy', 'Dream', 'Hope'];
+  const word = words[Math.floor(Math.random() * words.length)];
+  const year = Math.floor(Math.random() * (2005 - 1980 + 1)) + 1980;
+  const special = ['@', '#', '!', '$'][Math.floor(Math.random() * 4)];
+  return `${firstName}${word}${year}${special}`;
 }
 
 // ── Microsoft Outlook login ──────────────────────────────────────────────────
@@ -67,11 +49,15 @@ async function loginMicrosoft(ctx, hotmailEmail, hotmailPassword) {
   // Fill email (#usernameEntry)
   step('MS login — fill email');
   await loginPage.waitForSelector('#usernameEntry', { timeout: 20000 });
+  
+  await think(1500, 3000);
+  await smoothScroll(loginPage);
+
   await typeHuman(loginPage, '#usernameEntry', hotmailEmail);
   await loginPage.waitForTimeout(500 + Math.random() * 300);
 
   // Click Next
-  await loginPage.click('button[data-testid="primaryButton"]');
+  await clickHuman(loginPage, 'button[data-testid="primaryButton"]');
   await loginPage.waitForTimeout(1500 + Math.random() * 500);
 
   // The passkey/authenticator interstitial is conditional — accounts without one land on the
@@ -88,7 +74,7 @@ async function loginMicrosoft(ctx, hotmailEmail, hotmailPassword) {
     throw new Error('MS login: neither the passkey link nor the password field appeared');
   }
   if (route === 'link') {
-    await loginPage.click(PASSWORD_LINK);
+    await clickHuman(loginPage, PASSWORD_LINK);
     await loginPage.waitForTimeout(800 + Math.random() * 400);
   }
 
@@ -100,7 +86,7 @@ async function loginMicrosoft(ctx, hotmailEmail, hotmailPassword) {
 
   // Submit password (Next button)
   step('MS login — submit password');
-  await loginPage.click('button[data-testid="primaryButton"]');
+  await clickHuman(loginPage, 'button[data-testid="primaryButton"]');
   await loginPage.waitForTimeout(2000);
 
   // Dismiss passkey dialog if it appears (native OS dialog)
@@ -119,16 +105,16 @@ async function loginMicrosoft(ctx, hotmailEmail, hotmailPassword) {
   ]);
 
   if (prompt === 'ok') {
-    await loginPage.click('button:has-text("OK")');
+    await clickHuman(loginPage, 'button:has-text("OK")');
     await loginPage.waitForTimeout(1500);
     // After OK, No button may appear
     const noBtn = await loginPage.waitForSelector('button:has-text("No")', { timeout: 10000 }).catch(() => null);
     if (noBtn) {
-      await noBtn.click();
+      await clickHuman(loginPage, noBtn);
       await loginPage.waitForTimeout(1500);
     }
   } else if (prompt === 'no') {
-    await loginPage.click('button:has-text("No")');
+    await clickHuman(loginPage, 'button:has-text("No")');
     await loginPage.waitForTimeout(1500);
   }
 
@@ -198,7 +184,7 @@ async function pollOutlookInbox(outookPage, timeoutMs = INBOX_TIMEOUT_MS, mode =
       // already hold a message of the other kind - an old verification link when a reset
       // link is wanted - and taking the first match would return the wrong one.
       for (let i = 0; i < count; i++) {
-        await rows.nth(i).click();
+        await clickHuman(signupPage, rows.nth(i));
         await outookPage.waitForTimeout(2000);
 
         const body = await outookPage.evaluate(() => document.body.innerHTML);
@@ -243,6 +229,9 @@ async function processAccount(ctx, cred) {
   await signupPage.goto('https://elevenlabs.io/app/sign-up', { waitUntil: 'domcontentloaded' });
   await signupPage.waitForSelector('[data-testid="sign-up-email-input"]', { timeout: 15000 });
 
+  await think(1500, 3500);
+  await smoothScroll(signupPage);
+
   await signupPage.waitForTimeout(800 + Math.random() * 500);
   await typeHuman(signupPage, '[data-testid="sign-up-email-input"]', hotmailEmail);
   await signupPage.waitForTimeout(400 + Math.random() * 300);
@@ -250,7 +239,7 @@ async function processAccount(ctx, cred) {
   await signupPage.waitForTimeout(600 + Math.random() * 400);
 
   console.log('[2] Clicking Sign up...');
-  await signupPage.click('button[style*="view-transition-name: submit"]');
+  await clickHuman(signupPage, 'button[style*="view-transition-name: submit"]');
 
   // 3. Handle CAPTCHA
   step('wait for signup (CAPTCHA may need manual solve)');
@@ -279,7 +268,7 @@ async function processAccount(ctx, cred) {
   // 6. Continue
   step('click Continue');
   await verifyPage.waitForSelector('button:has-text("Continue")', { timeout: 15000 });
-  await verifyPage.click('button:has-text("Continue")');
+  await clickHuman(verifyPage, 'button:has-text("Continue")');
   await verifyPage.waitForTimeout(2000);
 
   await signInAndCreateKey(verifyPage, rowIndex, hotmailEmail, elevenPassword);
@@ -301,7 +290,7 @@ async function grantAllPermissions(page) {
     throw new Error('Restrict Key toggle not found - dialog layout changed');
   }
   if (await restrictToggle.getAttribute('aria-checked') !== 'true') {
-    await restrictToggle.click();
+    await clickHuman(page, restrictToggle);
     await page.waitForTimeout(400);
   }
 
@@ -319,7 +308,7 @@ async function grantAllPermissions(page) {
 
     if (await target.count() === 0) continue;
     if (await target.getAttribute('aria-selected') !== 'true') {
-      await target.click();
+      await clickHuman(page, target);
       await page.waitForTimeout(80);
     }
     granted++;
@@ -373,7 +362,7 @@ async function attemptSignIn(page, email, elevenPassword) {
   await page.waitForTimeout(300);
   await typeHuman(page, '[data-testid="sign-in-password-input"]', elevenPassword);
   await page.waitForTimeout(400);
-  await page.click('[data-testid="sign-in-submit-button"]');
+  await clickHuman(page, '[data-testid="sign-in-submit-button"]');
 
   const SETTLE_MS = 30000;
   const outcome = await firstOutcome([
@@ -409,10 +398,10 @@ async function signInAndCreateKey(page, rowIndex, email, elevenPassword) {
 async function finishOnboardingAndKey(page, rowIndex, email, elevenPassword) {
   // 8. Onboarding
   step('onboarding');
-  const firstName = ['Alex', 'Jordan', 'Taylor', 'Morgan', 'Casey', 'Riley'][Math.floor(Math.random() * 6)];
+  const { firstName } = generateRealisticName();
 
   await page.waitForSelector('button:has-text("Continue")', { timeout: 10000 })
-    .then(() => page.click('button:has-text("Continue")'))
+    .then(() => clickHuman(page, 'button:has-text("Continue")'))
     .catch(() => {});
   await page.waitForTimeout(1500);
 
@@ -420,16 +409,21 @@ async function finishOnboardingAndKey(page, rowIndex, email, elevenPassword) {
   if (firstNameInput) {
     await typeHuman(page, '#firstname', firstName);
     await page.waitForTimeout(500);
-    const ageCheckbox = await page.$('.checkbox-hitarea');
-    if (ageCheckbox) { await ageCheckbox.click(); await page.waitForTimeout(300); }
-    await page.click('button[type="submit"]:has-text("Next")');
+    const ageCheckbox = await page.$('input[type="checkbox"][name*="age"]');
+    if (ageCheckbox) { await clickHuman(page, ageCheckbox); await page.waitForTimeout(300); }
+    await clickHuman(page, 'button[type="submit"]:has-text("Next")');
     await page.waitForTimeout(1500);
   }
 
   for (let i = 0; i < 3; i++) {
     const skip = await page.$('button:has-text("Skip")');
-    if (skip) { await skip.click(); await page.waitForTimeout(1000); }
+    if (skip) { await clickHuman(page, skip); await page.waitForTimeout(1000); }
   }
+
+  // Acknowledge welcome banners
+  await page.waitForSelector('button:has-text("Got it")', { timeout: 3000 })
+    .then(() => clickHuman(page, 'button:has-text("Got it")'))
+    .catch(() => {});
 
   // 9. Create API key
   step('create API key');
@@ -444,7 +438,7 @@ async function finishOnboardingAndKey(page, rowIndex, email, elevenPassword) {
   await page.waitForTimeout(300);
 
   await page.waitForSelector('button:has-text("Create Key")', { timeout: 10000 });
-  await page.click('button:has-text("Create Key")');
+  await clickHuman(page, 'button:has-text("Create Key")');
   await page.waitForTimeout(1000);
 
   const keyName = 'Key-' + Math.random().toString(36).slice(2, 8).toUpperCase();
@@ -465,7 +459,7 @@ async function finishOnboardingAndKey(page, rowIndex, email, elevenPassword) {
   // Confirm "No Permissions Selected" dialog if it appears
   const confirmCreate = page.locator('button[data-agent-protected="true"]', { hasText: 'Create Key' });
   if (await confirmCreate.count() > 0) {
-    await confirmCreate.last().click({ timeout: 10000 });
+    await clickHuman(page, confirmCreate.last());
     await page.waitForTimeout(1500);
   }
 
@@ -538,7 +532,7 @@ ${'═'.repeat(60)}`);
   await page.waitForTimeout(400);
 
   // Continue starts disabled and enables once the address validates; click() waits for that.
-  await page.getByRole('button', { name: 'Continue', exact: true }).click({ timeout: 15000 });
+  await clickHuman(page, page.getByRole('button', { name: 'Continue', exact: true }));
 
   // Confirm the request actually went out. Without this a silent failure would send us to
   // the mailbox to wait two minutes for an email that was never sent.
@@ -709,7 +703,7 @@ ${'═'.repeat(60)}`);
 
     step('resume — click Continue');
     await page.waitForSelector('button:has-text("Continue")', { timeout: 15000 });
-    await page.click('button:has-text("Continue")');
+    await clickHuman(page, 'button:has-text("Continue")');
     await page.waitForTimeout(2000);
 
     outcome = await attemptSignIn(page, email, elevenPass);
@@ -735,6 +729,9 @@ function parseArgs(argv) {
   const resume = argv.includes('--resume');
   const resetPassword = argv.includes('--reset-password');
   const regenerateKey = argv.includes('--regenerate-key');
+  const noProxy = argv.includes('--no-proxy');
+  const proxyTokenArg = argv.find((a) => a.startsWith('--proxy-token='));
+  const proxyToken = proxyTokenArg ? proxyTokenArg.slice('--proxy-token='.length) : null;
   const rowsArg = argv.find((a) => a.startsWith('--rows='));
   const limit = limitArg ? Number(limitArg.split('=')[1]) : Infinity;
   const row = rowArg ? Number(rowArg.split('=')[1]) : null;
@@ -755,11 +752,15 @@ function parseArgs(argv) {
     throw new Error('--regenerate-key needs --rows=<n,n,...> naming the rows to re-key');
   }
 
-  return { limit, row, rows, resume, resetPassword, regenerateKey };
+  if (noProxy && proxyToken) {
+    throw new Error('--no-proxy and --proxy-token are mutually exclusive');
+  }
+
+  return { limit, row, rows, resume, resetPassword, regenerateKey, noProxy, proxyToken };
 }
 
 async function run() {
-  const { limit, row, rows, resume, resetPassword, regenerateKey } = parseArgs(process.argv.slice(2));
+  const { limit, row, rows, resume, resetPassword, regenerateKey, noProxy, proxyToken } = parseArgs(process.argv.slice(2));
 
   await initSheets();
 
@@ -812,18 +813,23 @@ async function run() {
     return;
   }
 
-  step('launch Chromium');
-  browser = await chromium.launch({
-    headless: false,
-    args: [
-      '--disable-blink-features=AutomationControlled',
-      '--no-sandbox',
-      '--disable-infobars',
-    ],
-    ignoreDefaultArgs: ['--enable-automation'],
-    slowMo: 50,
-  });
+  // Find a default proxy token if user only filled one cell
+  let defaultToken = null;
+  if (proxyToken) {
+    defaultToken = proxyToken;
+    console.log('\n[proxy] Using --proxy-token for this run (overrides the sheet).');
+  } else if (noProxy) {
+    console.log('\n[proxy] --no-proxy: skipping proxy rotation for this run.');
+  } else {
+    const allRowsForToken = await loadRows();
+    const availableTokens = [...new Set(allRowsForToken.map((r) => r.proxyToken).filter(Boolean))];
+    defaultToken = availableTokens.length > 0 ? availableTokens[0] : null;
+    if (defaultToken) {
+      console.log(`\n[proxy] Global proxy token found (${availableTokens.length} total). Will fallback to this token if a row is empty.`);
+    }
+  }
 
+  // The browser will be launched per-account via GPM-Login API.
   for (let i = 0; i < pendingRows.length; i++) {
     const cred = pendingRows[i];
     console.log(`\n[${i + 1}/${pendingRows.length}] ${cred.email} (sheet row ${cred.rowIndex})`);
@@ -835,14 +841,43 @@ async function run() {
     // One context per account. A fresh context drops cookies, localStorage and IndexedDB, so
     // the previous account's Microsoft session cannot leak into this login. Closing it also
     // disposes every tab the account opened.
-    const ctx = await browser.newContext({
-      permissions: ['clipboard-read', 'clipboard-write'],
-    });
-    await ctx.addInitScript(() => {
-      Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-    });
+    
+    let proxyString = '';
+    const activeToken = noProxy ? null : (proxyToken || cred.proxyToken || defaultToken);
+    if (activeToken) {
+      step('rotate proxy');
+      console.log(`[proxy] Fetching new proxy using token...`);
+      try {
+        const proxyData = await getNewProxyWithRetry(activeToken);
+        proxyString = proxyData.proxy; // Dạng IP:Port:User:Pass
+        console.log(`[proxy] Got proxy: ${proxyString}`);
+      } catch (err) {
+        console.error(`\n❌ FAILED [${cred.email}] at step: proxy rotation`);
+        console.error(err.stack || err.message);
+        await updateStatus(cred.rowIndex, 'failed:proxy_api').catch(() => {});
+        continue;
+      }
+    }
+
+    let gpmProfileId = null;
+    let ctx = null;
 
     try {
+      step('create GPM profile');
+      gpmProfileId = await gpm.createProfile(cred.email, proxyString);
+      console.log(`[GPM] Created profile ${gpmProfileId}`);
+      
+      step('start GPM profile');
+      const debugAddress = await gpm.startProfile(gpmProfileId);
+      console.log(`[GPM] Started, debug address: ${debugAddress}`);
+      // Đợi trình duyệt GPM thực sự sẵn sàng
+      await new Promise(r => setTimeout(r, 3000));
+
+      step('connect to GPM via CDP');
+      browser = await chromium.connectOverCDP(`http://${debugAddress}`);
+      const contexts = browser.contexts();
+      ctx = contexts.length > 0 ? contexts[0] : await browser.newContext();
+
       // Every path writes its own success row via updateResult.
       if (regenerateKey) await regenerateAccountKey(ctx, cred);
       else if (resetPassword) await resetPasswordAndCreateKey(ctx, cred);
@@ -852,9 +887,15 @@ async function run() {
       console.error(`\n❌ FAILED [${cred.email}] at step: ${currentStep}`);
       console.error(err.stack || err.message);
 
-      // Classify failure: MS login steps = account inactive/bad creds
-      const isInactive = !resume && !resetPassword && !regenerateKey && currentStep.startsWith('MS login');
-      const failStatus = isInactive ? 'inactive' : `failed:${currentStep}`;
+      // Classify failure: MS login steps = account inactive/bad creds.
+      // But a transport failure (proxy refusing, connection closed, DNS) says nothing about
+      // the mailbox - the credentials were never even submitted. Calling that 'inactive'
+      // tells the operator to write off a perfectly good account; observed when a US proxy
+      // could not reach login.live.com and the row was marked dead.
+      const isNetworkError = /net::ERR_/.test(err.message || '');
+      const isInactive = !resume && !resetPassword && !regenerateKey
+        && currentStep.startsWith('MS login') && !isNetworkError;
+      const failStatus = isNetworkError ? 'failed:network' : isInactive ? 'inactive' : `failed:${currentStep}`;
 
       // Status column only. Never blank F/G here: the ElevenLabs account may already exist
       // with its password recorded, and losing it would orphan the account for good.
@@ -878,7 +919,18 @@ async function run() {
       console.log('Continuing to next account...');
     } finally {
       activePage = null;
-      await ctx.close().catch((e) => console.error(`[cleanup] ${e.message}`));
+      if (browser) {
+        // Just disconnect the CDP session
+        await browser.close().catch(() => {});
+        browser = null;
+      }
+      if (gpmProfileId) {
+        step('stop and delete GPM profile');
+        await gpm.stopProfile(gpmProfileId).catch(() => {});
+        await new Promise(r => setTimeout(r, 2000));
+        await gpm.deleteProfile(gpmProfileId).catch(() => {});
+        console.log(`[GPM] Profile ${gpmProfileId} deleted.`);
+      }
     }
   }
 

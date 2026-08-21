@@ -4,10 +4,10 @@ const SHEET_ID = '1nNAzzC34zSvX2S_AJ4jB6njhKnKRWs8KeZ0mJ5oSkTU';
 const SHEET_NAME = 'hotmail';
 
 // Columns (0-indexed into a row array): A=email B=password C=msaToken D=tenantGuid
-//                                       E=recoveryEmail F=apiKey G=elevenPass H=status
+//                                       E=recoveryEmail F=apiKey G=elevenPass H=status I=proxyToken
 const COL = {
   email: 0, password: 1, msaToken: 2, tenantGuid: 3, recoveryEmail: 4,
-  apiKey: 5, elevenPass: 6, status: 7,
+  apiKey: 5, elevenPass: 6, status: 7, proxyToken: 8,
 };
 
 let sheetsClient = null;
@@ -41,7 +41,7 @@ function client() {
 async function loadRows() {
   const res = await client().spreadsheets.values.get({
     spreadsheetId: SHEET_ID,
-    range: `${SHEET_NAME}!A:H`,
+    range: `${SHEET_NAME}!A:I`,
   });
   const rows = res.data.values || [];
   return rows.slice(1).map((r, i) => ({
@@ -54,6 +54,7 @@ async function loadRows() {
     apiKey: r[COL.apiKey] || '',
     elevenPass: r[COL.elevenPass] || '',
     status: (r[COL.status] || '').trim().toLowerCase(),
+    proxyToken: (r[COL.proxyToken] || '').trim(),
   }));
 }
 
