@@ -170,11 +170,16 @@ async function waitForManualSignup(page) {
 async function pollOutlookInbox(outookPage, timeoutMs = INBOX_TIMEOUT_MS, mode = 'verifyEmail') {
   const start = Date.now();
   const wanted = `mode=${mode}`;
+  let checkJunkNext = false;
 
   while (Date.now() - start < timeoutMs) {
     try {
-      await outookPage.reload({ waitUntil: 'domcontentloaded' });
-      await outookPage.waitForTimeout(2000);
+      // Alternate between Inbox and Junk Email to catch spam-routed emails
+      const targetFolder = checkJunkNext ? 'junkemail' : 'inbox';
+      await outookPage.goto(`https://outlook.live.com/mail/0/${targetFolder}`, { waitUntil: 'domcontentloaded' });
+      checkJunkNext = !checkJunkNext;
+
+      await outookPage.waitForTimeout(3000);
 
       // Outlook renders each message row with role="option".
       const rows = outookPage.locator('[role="option"]').filter({ hasText: 'ElevenLabs' });
@@ -184,7 +189,9 @@ async function pollOutlookInbox(outookPage, timeoutMs = INBOX_TIMEOUT_MS, mode =
       // already hold a message of the other kind - an old verification link when a reset
       // link is wanted - and taking the first match would return the wrong one.
       for (let i = 0; i < count; i++) {
-        await clickHuman(outookPage, rows.nth(i));
+        // Outlook renders each message row with role="option".
+        const rowLocator = outookPage.locator('[role="option"]').filter({ hasText: 'ElevenLabs' }).nth(i);
+        await clickHuman(outookPage, rowLocator);
         await outookPage.waitForTimeout(2000);
 
         const body = await outookPage.evaluate(() => document.body.innerHTML);
@@ -201,7 +208,7 @@ async function pollOutlookInbox(outookPage, timeoutMs = INBOX_TIMEOUT_MS, mode =
     await outookPage.waitForTimeout(5000);
   }
 
-  throw new Error(`Timeout: no ElevenLabs ${mode} email in Outlook inbox`);
+  throw new Error(`Timeout: no ElevenLabs ${mode} email in Outlook inbox or junk folder`);
 }
 
 // ── Process one hotmail account end-to-end ───────────────────────────────────
