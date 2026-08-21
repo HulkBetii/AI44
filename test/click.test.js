@@ -111,6 +111,35 @@ const url = pathToFileURL(path.join(__dirname, 'fixtures', 'click-targets.html')
     await page.close();
   }
 
+
+  // Chrome throttles background tabs and defers their layout, so scrollIntoViewIfNeeded,
+  // boundingBox and elementFromPoint all go stale if another tab takes the foreground. A live
+  // run stalled in the API-key dialog until the operator switched tabs by hand. clickHuman
+  // must claim the foreground before it reads any position.
+  //
+  // Playwright's own browser does not actually background tabs (visibilityState stays
+  // "visible"), so this asserts the contract - that bringToFront is called, and before the
+  // first mouse event - rather than the browser behaviour it protects against.
+  {
+    const page = await browser.newPage({ viewport: { width: 900, height: 600 } });
+    await page.goto(url);
+
+    const calls = [];
+    const realBring = page.bringToFront.bind(page);
+    page.bringToFront = async () => { calls.push('bringToFront'); return realBring(); };
+    const realMove = page.mouse.move.bind(page.mouse);
+    page.mouse.move = async (...a) => { calls.push('mouse.move'); return realMove(...a); };
+
+    await clickHuman(page, '#belowFold');
+
+    assert.ok(calls.includes('bringToFront'), 'clickHuman must bring the page to the foreground');
+    assert.strictEqual(calls[0], 'bringToFront',
+      `foreground must be claimed before any mouse movement, got ${calls.slice(0, 3).join(' -> ')}`);
+    assert.strictEqual(await page.locator('#belowState').textContent(), 'CLICKED');
+    console.log('✓ claims the foreground before reading any position');
+    await page.close();
+  }
+
   await browser.close();
   console.log('\nAll assertions passed.');
 })().catch((e) => { console.error('FAILED:', e.message); process.exit(1); });

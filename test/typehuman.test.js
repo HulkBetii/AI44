@@ -49,6 +49,35 @@ const EMAIL = 'averylongtestaddress99@example.com'; // 34 chars
     await page.close();
   }
 
+
+  // The sign-in field arrives pre-filled after email verification. typeHuman used to type on
+  // top of that, producing exactly double the intended value - a live run logged 58 chars for
+  // a 29-char address, and again 26 for a 13-char password.
+  {
+    const page = await browser.newPage({ viewport: { width: 900, height: 600 } });
+    await page.goto(`${base}?prefill=${encodeURIComponent(EMAIL)}`);
+    assert.strictEqual(await page.locator('#field').inputValue(), EMAIL, 'fixture must start pre-filled');
+
+    // The repair path would rescue the value either way, so assert the field was cleared up
+    // front: a repair here means typeHuman typed on top of existing text.
+    const warnings = [];
+    const realWarn = console.warn;
+    console.warn = (...a) => warnings.push(a.join(' '));
+    try {
+      await typeHuman(page, '#field', EMAIL);
+    } finally {
+      console.warn = realWarn;
+    }
+
+    assert.strictEqual(await page.locator('#field').inputValue(), EMAIL);
+    assert.deepStrictEqual(
+      warnings, [],
+      `typing into a pre-filled field must replace it, not append: ${warnings.join(' | ')}`,
+    );
+    console.log('✓ a pre-filled field is cleared before typing, not appended to');
+    await page.close();
+  }
+
   await browser.close();
   console.log('\nAll assertions passed.');
 })().catch((e) => { console.error('FAILED:', e.message); process.exit(1); });

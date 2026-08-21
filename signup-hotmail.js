@@ -19,6 +19,20 @@ function csvCell(value) {
   return Q + String(value ?? '').split(Q).join(Q + Q) + Q;
 }
 
+
+// Appends one line, adding the separator the existing file is missing if its last byte is
+// not a newline.
+function appendLine(file, text) {
+  let prefix = '';
+  if (fs.existsSync(file) && fs.statSync(file).size > 0) {
+    const fd = fs.openSync(file, 'r');
+    const last = Buffer.alloc(1);
+    fs.readSync(fd, last, 0, 1, fs.statSync(file).size - 1);
+    fs.closeSync(fd);
+    if (last.toString('utf8') !== '\n') prefix = '\n';
+  }
+  fs.appendFileSync(file, prefix + text + '\n', 'utf8');
+}
 function appendSuccessCSV(cred, elevenPassword, apiKey, proxyString) {
   if (!fs.existsSync(SUCCESS_CSV)) {
     fs.writeFileSync(SUCCESS_CSV,
@@ -31,7 +45,10 @@ function appendSuccessCSV(cred, elevenPassword, apiKey, proxyString) {
   fs.appendFileSync(SUCCESS_CSV, row, 'utf8');
   
   if (apiKey) {
-    fs.appendFileSync(KEYS_TXT, apiKey + '\n', 'utf8');
+    // A file whose last line has no newline - one written by hand, or by any other tool -
+    // would otherwise have the next key appended onto the end of it, silently fusing two
+    // keys into one unusable line. That already happened once to this file.
+    appendLine(KEYS_TXT, apiKey);
   }
 }
 

@@ -9,6 +9,8 @@
 // path in typeHuman relies on.
 const params = new URLSearchParams(location.search);
 const CAP = Number(params.get('cap') ?? Infinity);
+// The sign-in page arrives with the address already filled in after email verification.
+if (params.get('prefill')) document.getElementById('field').value = params.get('prefill');
 // A real maxlength caps direct value-setting too, so even the repair path cannot win - the
 // case where typeHuman must give up loudly rather than report a value it never stored.
 if (params.get('maxlength')) {

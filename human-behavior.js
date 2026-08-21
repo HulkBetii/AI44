@@ -118,6 +118,13 @@ async function clickHuman(page, selectorOrLocator, { timeoutMs = 30000 } = {}) {
     locator = selectorOrLocator;
   }
 
+  // Everything below depends on layout: scrollIntoViewIfNeeded, boundingBox and
+  // elementFromPoint all read positions. Chrome throttles background tabs and defers their
+  // layout, so if another tab takes the foreground mid-run these go stale and the click
+  // polls until its deadline - a live run stalled in the API-key dialog until the operator
+  // switched back to the tab by hand.
+  await page.bringToFront().catch(() => {});
+
   // Raw page.mouse events bypass every actionability check locator.click() performs, so the
   // two that this pipeline depends on have to be reproduced here.
 
@@ -238,6 +245,12 @@ const QWERTY_ADJACENT = {
 async function typeHuman(page, selector, text) {
   // Click vào trường nhập liệu trước bằng Human Mouse
   await clickHuman(page, selector);
+
+  // Clear first. ElevenLabs arrives at sign-in with the address already filled in after email
+  // verification, and typing on top of that produced exactly double the value - a live run
+  // logged 58 characters for a 29-character address. The repair below rescued it, but only
+  // after typing the whole thing twice.
+  await page.fill(selector, '');
   
   for (let i = 0; i < text.length; i++) {
     const char = text[i];
@@ -277,7 +290,8 @@ async function typeHuman(page, selector, text) {
   // Khắc phục lỗi React re-render làm rơi ký tự
   const landed = await page.inputValue(selector);
   if (landed !== text) {
-    console.warn(`[type] field truncated (${landed.length}/${text.length} chars) - repairing`);
+    const how = landed.length > text.length ? 'over-filled' : 'truncated';
+    console.warn(`[type] field ${how} (${landed.length}/${text.length} chars) - repairing`);
     await page.fill(selector, text);
     const repaired = await page.inputValue(selector);
     if (repaired !== text) {

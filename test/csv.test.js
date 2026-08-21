@@ -12,6 +12,7 @@ const SUCCESS_CSV = path.join(os.tmpdir(), `success-test-${process.pid}.csv`);
 const KEYS_TXT = path.join(os.tmpdir(), `keys-test-${process.pid}.txt`);
 const build = () => new Function('fs', 'SUCCESS_CSV', 'KEYS_TXT', 'Q', `
   ${src.match(/function csvCell\(value\) \{[\s\S]*?\n\}/)[0]}
+  ${src.match(/function appendLine\(file, text\) \{[\s\S]*?\n\}/)[0]}
   ${src.match(/function appendSuccessCSV\([\s\S]*?\n\}/)[0]}
   return appendSuccessCSV;
 `)(fs, SUCCESS_CSV, KEYS_TXT, String.fromCharCode(34));
@@ -83,6 +84,16 @@ console.log('✓ the run loop clears cred.apiKey before each account');
 const keyLines = fs.readFileSync(KEYS_TXT, 'utf8').trim().split('\n');
 assert.deepStrictEqual(keyLines, ['sk_abc123', 'sk_def456']);
 console.log('✓ keys.txt receives one key per line');
+
+// A keys file whose last line has no newline - hand-written, or produced by another tool -
+// used to get the next key appended onto the end of it, fusing two keys into one unusable
+// line. That happened to the real file: 'sk_8501...' and 'sk_ffdf...' arrived joined.
+fs.writeFileSync(KEYS_TXT, 'sk_existingkey', 'utf8');   // deliberately no trailing newline
+appendSuccessCSV({ email: 'c@example.com', password: 'pw' }, 'ev', 'sk_newkey', '');
+const rescued = fs.readFileSync(KEYS_TXT, 'utf8').split('\n').filter(Boolean);
+assert.deepStrictEqual(rescued, ['sk_existingkey', 'sk_newkey'],
+  'a file not ending in a newline must not have the next key fused onto its last line');
+console.log('✓ appends safely to a file that does not end in a newline');
 
 for (const f of [SUCCESS_CSV, KEYS_TXT]) { try { fs.unlinkSync(f); } catch {} }
 console.log('\nAll assertions passed.');
