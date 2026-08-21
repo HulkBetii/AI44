@@ -69,13 +69,72 @@ const STEP_RENDER_TIMEOUT_MS = 20000; // the app shows a blank splash before eac
 let browser = null;
 let activePage = null;
 let currentStep = 'init';
+// Module scope, not loop scope: a GPM profile outlives the process - it is a started browser
+// plus a folder on disk - so every exit path has to be able to see it and release it.
+let gpmProfileId = null;
 
 function step(name) {
   currentStep = name;
   console.log(`[step] ${name}`);
 }
 
-const { 
+// The single place the browser connection and the GPM profile are released. Both the
+// per-account finally and the signal handler go through it, so an interrupted run cleans up
+// the same way a finished one does.
+//
+// A release in flight is shared rather than skipped. Ctrl+C landing midway through the normal
+// cleanup would otherwise find gpmProfileId already nulled, return straight away, and let the
+// handler's process.exit kill the delete that was still in flight - reintroducing the leak
+// exactly when the operator was watching for it.
+let releasing = null;
+function releaseProfile() {
+  if (releasing) return releasing;
+  releasing = (async () => {
+    activePage = null;
+    if (browser) {
+      // Just disconnect the CDP session
+      await browser.close().catch(() => {});
+      browser = null;
+    }
+    const id = gpmProfileId;
+    if (!id) return;
+    gpmProfileId = null;
+
+    step('stop and delete GPM profile');
+    await gpm.stopProfile(id)
+      .catch((e) => console.warn(`[GPM] stop failed for ${id}: ${e.message}`));
+    await new Promise((r) => setTimeout(r, 2000));
+    // Report what actually happened: mode=2 removes the profile folder, so a run that
+    // keeps failing here silently accumulates one directory per account.
+    await gpm.deleteProfile(id)
+      .then(() => console.log(`[GPM] Profile ${id} deleted.`))
+      .catch((e) => console.warn(`[GPM] DELETE FAILED for ${id}: ${e.message} - profile folder left on disk`));
+  })();
+  // Cleared once settled so the next account gets its own release, not this one's result.
+  return releasing.finally(() => { releasing = null; });
+}
+
+// Ctrl+C killed the process outright, so neither the per-account finally nor the outer one
+// ran: the profile stayed started and its folder stayed on disk, one leaked per interrupted
+// run. Interrupting mid-account is routine here, so this is the common path, not the rare one.
+let shuttingDown = false;
+for (const sig of ['SIGINT', 'SIGTERM']) {
+  process.on(sig, () => {
+    if (shuttingDown) {
+      // Pressed twice: the operator wants out now. Say what is being abandoned so it can be
+      // removed by hand rather than lingering unnoticed.
+      console.error(`\n[${sig}] forced exit - profile ${gpmProfileId || '(none)'} left behind.`);
+      process.exit(130);
+    }
+    shuttingDown = true;
+    console.error(`\n[${sig}] received - releasing GPM profile before exit (Ctrl+C again to force)…`);
+    releaseProfile()
+      .catch((e) => console.error(`[cleanup] ${e.message}`))
+      .finally(() => process.exit(130));
+  });
+}
+
+const {
   think, clickHuman, typeHuman, smoothScroll, generateRealisticName, poissonIntervalDelay
 } = require('./human-behavior');
 
@@ -1060,7 +1119,7 @@ async function run() {
       }
     }
 
-    let gpmProfileId = null;
+    gpmProfileId = null;
     let ctx = null;
 
     try {
@@ -1122,23 +1181,7 @@ async function run() {
 
       console.log('Continuing to next account...');
     } finally {
-      activePage = null;
-      if (browser) {
-        // Just disconnect the CDP session
-        await browser.close().catch(() => {});
-        browser = null;
-      }
-      if (gpmProfileId) {
-        step('stop and delete GPM profile');
-        await gpm.stopProfile(gpmProfileId)
-          .catch((e) => console.warn(`[GPM] stop failed for ${gpmProfileId}: ${e.message}`));
-        await new Promise(r => setTimeout(r, 2000));
-        // Report what actually happened: mode=2 removes the profile folder, so a run that
-        // keeps failing here silently accumulates one directory per account.
-        await gpm.deleteProfile(gpmProfileId)
-          .then(() => console.log(`[GPM] Profile ${gpmProfileId} deleted.`))
-          .catch((e) => console.warn(`[GPM] DELETE FAILED for ${gpmProfileId}: ${e.message} - profile folder left on disk`));
-      }
+      await releaseProfile();
     }
 
     // Tầng 4: Export tài khoản thành công ra CSV
@@ -1174,7 +1217,7 @@ run()
     process.exitCode = 1;
   })
   .finally(async () => {
-    if (browser) {
-      await browser.close().catch((err) => console.error(`[cleanup] ${err.message}`));
-    }
+    // A throw outside the per-account try - proxy setup, sheet init - skips the finally that
+    // normally releases the profile, so the outer path has to release it too.
+    await releaseProfile().catch((err) => console.error(`[cleanup] ${err.message}`));
   });
