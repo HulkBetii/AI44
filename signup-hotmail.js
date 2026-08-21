@@ -184,7 +184,7 @@ async function pollOutlookInbox(outookPage, timeoutMs = INBOX_TIMEOUT_MS, mode =
       // already hold a message of the other kind - an old verification link when a reset
       // link is wanted - and taking the first match would return the wrong one.
       for (let i = 0; i < count; i++) {
-        await clickHuman(signupPage, rows.nth(i));
+        await clickHuman(outookPage, rows.nth(i));
         await outookPage.waitForTimeout(2000);
 
         const body = await outookPage.evaluate(() => document.body.innerHTML);
@@ -227,7 +227,8 @@ async function processAccount(ctx, cred) {
   await signupPage.evaluate(() => { localStorage.clear(); sessionStorage.clear(); });
 
   await signupPage.goto('https://elevenlabs.io/app/sign-up', { waitUntil: 'domcontentloaded' });
-  await signupPage.waitForSelector('[data-testid="sign-up-email-input"]', { timeout: 15000 });
+  // Wait for the full app shell to mount (avoids hitting the blank IIElevenLabs loading screen)
+  await signupPage.waitForSelector('[data-testid="sign-up-email-input"]', { state: 'visible', timeout: 25000 });
 
   await think(1500, 3500);
   await smoothScroll(signupPage);
