@@ -13,6 +13,9 @@ const LOGIN_URL = 'https://login.live.com/';
 const SIGNUP_TIMEOUT_MS = 900000; // 15 min - CAPTCHA is solved by hand, allow for a break
 const INBOX_TIMEOUT_MS = 120000;  // 2 min — wait for ElevenLabs verify email
 const MS_LOGIN_TIMEOUT_MS = 15000;
+const LIST_RENDER_TIMEOUT_MS = 20000; // Outlook's message list after a cold SPA boot
+const ONBOARDING_TIMEOUT_MS = 120000; // ElevenLabs adds onboarding steps; drive them in a loop
+const STEP_RENDER_TIMEOUT_MS = 20000; // the app shows a blank splash before each step mounts
 
 // ── Module-scope state for failure handler ───────────────────────────────────
 let browser = null;
@@ -122,6 +125,7 @@ async function loginMicrosoft(ctx, hotmailEmail, hotmailPassword) {
   step('MS login — navigate to Outlook inbox');
   await loginPage.goto('https://outlook.live.com/mail/', { waitUntil: 'domcontentloaded' });
   await loginPage.waitForTimeout(5000);
+  await dismissConsentDialog(loginPage);
   console.log(`[MS] Inbox loaded: ${loginPage.url()}`);
 
   return loginPage;
@@ -166,6 +170,20 @@ async function waitForManualSignup(page) {
   }
 }
 
+// A fresh GPM profile gets Outlook's cookie/consent modal on first load, and it overlays the
+// whole mailbox - a run timed out "finding no mail" while the verification message sat
+// visible behind it. Decline rather than accept: nothing here needs the optional tracking.
+async function dismissConsentDialog(page) {
+  const reject = page.getByRole('button', { name: /^(Reject|Reject all|Decline)$/i }).first();
+  if (await reject.count().catch(() => 0) === 0) return false;
+  if (!await reject.isVisible().catch(() => false)) return false;
+
+  await reject.click({ timeout: 10000 }).catch(() => {});
+  await page.waitForTimeout(1000);
+  console.log('[outlook] Dismissed the cookie consent dialog (Reject).');
+  return true;
+}
+
 // ── Poll Outlook inbox via DOM ────────────────────────────────────────────────
 async function pollOutlookInbox(outookPage, timeoutMs = INBOX_TIMEOUT_MS, mode = 'verifyEmail') {
   const start = Date.now();
@@ -179,9 +197,17 @@ async function pollOutlookInbox(outookPage, timeoutMs = INBOX_TIMEOUT_MS, mode =
       await outookPage.goto(`https://outlook.live.com/mail/0/${targetFolder}`, { waitUntil: 'domcontentloaded' });
       checkJunkNext = !checkJunkNext;
 
-      await outookPage.waitForTimeout(3000);
+      // Outlook is a single-page app: domcontentloaded fires long before the message list is
+      // fetched and rendered. A fixed sleep was enough while this loop only reloaded an
+      // already-warm page, but navigating to a different folder each pass forces a full app
+      // boot - and a run then timed out while the verification mail sat visible in the inbox.
+      // Wait for the list itself; an empty folder simply falls through after the timeout.
+      await outookPage.waitForSelector('[role="option"]', { timeout: LIST_RENDER_TIMEOUT_MS })
+        .catch(() => {});
 
-      // Outlook renders each message row with role="option".
+      // Each folder navigation can re-raise the consent modal, and it covers the message list.
+      await dismissConsentDialog(outookPage);
+
       const rows = outookPage.locator('[role="option"]').filter({ hasText: 'ElevenLabs' });
       const count = await rows.count();
 
@@ -408,27 +434,98 @@ async function finishOnboardingAndKey(page, rowIndex, email, elevenPassword) {
   step('onboarding');
   const { firstName } = generateRealisticName();
 
-  await page.waitForSelector('button:has-text("Continue")', { timeout: 10000 })
-    .then(() => clickHuman(page, 'button:has-text("Continue")'))
-    .catch(() => {});
-  await page.waitForTimeout(1500);
+  // ElevenLabs keeps adding steps here - a "Choose your platform" screen appeared and the
+  // previous fixed sequence (one Continue, then the name form, then three Skips) walked past
+  // it, leaving onboarding unfinished. Navigating to the API keys page then bounced straight
+  // back and failed looking for a button that was never going to exist.
+  //
+  // Drive it as a loop instead: while the app is still on /app/onboarding, fill the name form
+  // if it is showing and otherwise press whatever advance control is present. That absorbs
+  // new steps without needing to know their order.
+  const ADVANCE_BUTTONS = ['Continue', 'Next', 'Skip', 'Get started', 'Got it'];
+  const onboardingDeadline = Date.now() + ONBOARDING_TIMEOUT_MS;
+  let lastSeen = '(nothing observed)';
 
-  const firstNameInput = await page.$('#firstname');
-  if (firstNameInput) {
-    await typeHuman(page, '#firstname', firstName);
-    await page.waitForTimeout(500);
-    const ageCheckbox = await page.$('input[type="checkbox"][name*="age"]');
-    if (ageCheckbox) { await clickHuman(page, ageCheckbox); await page.waitForTimeout(300); }
-    await clickHuman(page, 'button[type="submit"]:has-text("Next")');
-    await page.waitForTimeout(1500);
+  while (page.url().includes('/app/onboarding')) {
+    if (Date.now() > onboardingDeadline) {
+      throw new Error(
+        `Onboarding did not finish within ${ONBOARDING_TIMEOUT_MS}ms at ${page.url()}.
+Last seen: ${lastSeen}`);
+    }
+
+    // Wait for the step to render. Right after sign-in the app paints a blank splash, and
+    // it also re-routes between steps - checking for controls during either window finds
+    // nothing.
+    await page.waitForFunction(() => document.body.innerText.trim().length > 0,
+      { timeout: STEP_RENDER_TIMEOUT_MS }).catch(() => {});
+
+    // The age confirmation is a Radix checkbox: the hidden input is name="adult" (not "age"),
+    // and the thing that takes the click is the button, which wraps a .checkbox-hitarea.
+    if (await page.$('#firstname')) {
+      await typeHuman(page, '#firstname', firstName);
+      await page.waitForTimeout(500);
+
+      const ageCheckbox = await page.$('button[role="checkbox"]')
+        || await page.$('.checkbox-hitarea')
+        || await page.$('input[type="checkbox"][name*="adult"]');
+      if (ageCheckbox) {
+        if (await ageCheckbox.getAttribute('aria-checked') !== 'true') {
+          await clickHuman(page, ageCheckbox);
+          await page.waitForTimeout(400);
+        }
+      } else {
+        console.warn('[onboarding] age confirmation checkbox not found - Next will stay disabled');
+      }
+    }
+
+    // Record what this screen looks like, so a timeout can say what it kept seeing rather
+    // than reporting an empty string.
+    const heading = await page.evaluate(
+      () => (document.querySelector('h1, h5')?.innerText || document.body.innerText.slice(0, 120)).trim(),
+    ).catch(() => '');
+    // Some of these buttons are whole cards containing a feature list, so their innerText
+    // runs to dozens of lines. Collapse each to a single short label - this log is the main
+    // diagnostic when a step is not recognised, and it has to stay readable.
+    const labels = await page.evaluate(
+      () => [...document.querySelectorAll('button')]
+        .map((b) => (b.getAttribute('aria-label') || b.innerText || '').replace(/\s+/g, ' ').trim())
+        .filter(Boolean)
+        .map((t) => (t.length > 30 ? `${t.slice(0, 30)}…` : t))
+        .slice(0, 12),
+    ).catch(() => []);
+    lastSeen = `"${heading}" with buttons [${labels.join(', ')}]`;
+
+    let advanced = false;
+    for (const label of ADVANCE_BUTTONS) {
+      // ElevenLabs also ships clickable text with no button tag or ARIA role, so fall back
+      // to matching the visible text.
+      const byRole = page.getByRole('button', { name: label, exact: true });
+      const byText = page.getByText(label, { exact: true });
+      let control = null;
+      for (const candidate of [byRole, byText]) {
+        const first = candidate.first();
+        if (await first.count().catch(() => 0) === 0) continue;
+        if (!await first.isVisible().catch(() => false)) continue;
+        control = first;
+        break;
+      }
+      if (!control) continue;
+
+      console.log(`[onboarding] ${lastSeen} -> "${label}"`);
+      await clickHuman(page, control).catch((e) => {
+        console.warn(`[onboarding] click on "${label}" failed: ${e.message}`);
+      });
+      await page.waitForTimeout(1500);
+      advanced = true;
+      break;
+    }
+
+    // Nothing matched. Do not call it stuck: the app may still be routing between steps, or
+    // rendering one. Keep looking until the overall deadline decides.
+    if (!advanced) await page.waitForTimeout(1000);
   }
 
-  for (let i = 0; i < 3; i++) {
-    const skip = await page.$('button:has-text("Skip")');
-    if (skip) { await clickHuman(page, skip); await page.waitForTimeout(1000); }
-  }
-
-  // Acknowledge welcome banners
+  // Acknowledge welcome banners that appear once onboarding is behind us.
   await page.waitForSelector('button:has-text("Got it")', { timeout: 3000 })
     .then(() => clickHuman(page, 'button:has-text("Got it")'))
     .catch(() => {});
@@ -539,7 +636,7 @@ ${'═'.repeat(60)}`);
   await typeHuman(page, '[data-testid="forgot-password-email-input"]', email);
   await page.waitForTimeout(400);
 
-  // Continue starts disabled and enables once the address validates; click() waits for that.
+  // Continue starts disabled and enables once the address validates; clickHuman waits for that.
   await clickHuman(page, page.getByRole('button', { name: 'Continue', exact: true }));
 
   // Confirm the request actually went out. Without this a silent failure would send us to
@@ -910,6 +1007,9 @@ async function run() {
       await updateStatus(cred.rowIndex, failStatus)
         .catch((e) => console.error(`[sheet] status write failed: ${e.message}`));
 
+      if (!activePage || activePage.isClosed()) {
+        console.error(`[debug] No page to capture (activePage ${activePage ? 'was closed' : 'was never set'})`);
+      }
       if (activePage && !activePage.isClosed()) {
         try {
           console.error(`[debug] URL: ${activePage.url()}`);
@@ -934,10 +1034,14 @@ async function run() {
       }
       if (gpmProfileId) {
         step('stop and delete GPM profile');
-        await gpm.stopProfile(gpmProfileId).catch(() => {});
+        await gpm.stopProfile(gpmProfileId)
+          .catch((e) => console.warn(`[GPM] stop failed for ${gpmProfileId}: ${e.message}`));
         await new Promise(r => setTimeout(r, 2000));
-        await gpm.deleteProfile(gpmProfileId).catch(() => {});
-        console.log(`[GPM] Profile ${gpmProfileId} deleted.`);
+        // Report what actually happened: mode=2 removes the profile folder, so a run that
+        // keeps failing here silently accumulates one directory per account.
+        await gpm.deleteProfile(gpmProfileId)
+          .then(() => console.log(`[GPM] Profile ${gpmProfileId} deleted.`))
+          .catch((e) => console.warn(`[GPM] DELETE FAILED for ${gpmProfileId}: ${e.message} - profile folder left on disk`));
       }
     }
   }

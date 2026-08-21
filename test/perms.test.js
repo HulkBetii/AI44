@@ -4,8 +4,9 @@ const path = require('path');
 const { chromium } = require('playwright');
 
 const src = fs.readFileSync(path.join(__dirname, '..', 'signup-hotmail.js'), 'utf8');
+const { clickHuman } = require('../human-behavior.js');
 const fn = src.match(/async function grantAllPermissions\(page\) \{[\s\S]*?\n\}/)[0];
-const grantAllPermissions = new Function(`return ${fn}`)();
+const grantAllPermissions = new Function('clickHuman', `return ${fn}`)(clickHuman);
 
 (async () => {
   const browser = await chromium.launch();

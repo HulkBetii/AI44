@@ -1,0 +1,74 @@
+<!doctype html><html><body style="margin:0;font-family:sans-serif;padding:20px">
+<div id="screen"></div>
+<script>
+// Mirrors the five screens ElevenLabs actually serves, in the order observed:
+// platform chooser, personalisation form, role picker, interests picker, pricing.
+const PARAMS = new URLSearchParams(location.search);
+const steps = (PARAMS.get('steps') || 'platform,name,role,interests,pricing').split(',');
+const asSpan = PARAMS.get('span') === '1';
+const splash = Number(PARAMS.get('splash') || 0);
+const blankBetween = Number(PARAMS.get('blank') || 0);
+let i = 0;
+
+const advance = (text) => asSpan
+  ? '<span id="go" style="cursor:pointer;text-decoration:underline">' + text + '</span>'
+  : '<button id="go">' + text + '</button>';
+
+function render() {
+  const el = document.getElementById('screen');
+  if (i >= steps.length) {
+    history.replaceState({}, '', '/app/home');
+    el.innerHTML = '<h1>Home</h1>';
+    return;
+  }
+  const step = steps[i];
+
+  if (step === 'platform') {
+    el.innerHTML = '<h1>Choose your platform</h1>' + advance('Continue');
+  } else if (step === 'name') {
+    // The real form: a Radix checkbox button wrapping .checkbox-hitarea, whose hidden input
+    // is name="adult" - not "age", which is what the old selector looked for.
+    el.innerHTML = '<h1>Help us personalize your experience</h1>' +
+      '<input id="firstname" name="firstname" placeholder="Mary">' +
+      '<button type="button" role="checkbox" aria-checked="false" data-state="unchecked">' +
+        '<div class="checkbox-hitarea"></div></button>' +
+      '<input aria-hidden="true" tabindex="-1" type="checkbox" name="adult" style="position:absolute;opacity:0">' +
+      '<button type="submit" id="go" disabled>Next</button>';
+    const cb = el.querySelector('button[role=checkbox]');
+    const go = document.getElementById('go');
+    cb.addEventListener('click', () => {
+      const on = cb.getAttribute('aria-checked') === 'true';
+      cb.setAttribute('aria-checked', String(!on));
+      go.disabled = on;            // Next unlocks only once the box is ticked
+    });
+  } else if (step === 'role') {
+    el.innerHTML = '<h1>Which one describes you the best?</h1>' +
+      '<button aria-label="Personal use">Personal use</button>' +
+      '<button aria-label="Creator">Creator</button>' +
+      '<button>Back</button>' + advance('Skip');
+  } else if (step === 'interests') {
+    el.innerHTML = '<h1>What would you like to do with ElevenLabs?</h1>' +
+      '<button aria-label="Text to speech">Text to speech</button>' +
+      '<button>Back</button>' + advance('Skip');
+  } else if (step === 'pricing') {
+    el.innerHTML = '<h1>Do more with ElevenLabs</h1>' +
+      '<button>Select plan</button><button>Select plan</button>' +
+      advance('Skip') + '<button>Explore all plans</button>';
+  }
+
+  document.getElementById('go').addEventListener('click', () => {
+    if (steps[i] === 'name') window.__nameTyped = document.getElementById('firstname').value;
+    i++;
+    // Blank gap between steps, as the app shows while it re-routes.
+    if (blankBetween) {
+      document.getElementById('screen').innerHTML = '';
+      setTimeout(render, blankBetween);
+    } else {
+      setTimeout(render, 200);
+    }
+  });
+}
+history.replaceState({}, '', '/app/onboarding');
+if (splash) setTimeout(render, splash); else render();
+</script>
+</body></html>

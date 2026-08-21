@@ -1,47 +1,54 @@
 const assert = require('assert');
-const fs = require('fs');
 const path = require('path');
+const { pathToFileURL } = require('url');
+const { chromium } = require('playwright');
+const { typeHuman } = require('../human-behavior.js');
 
-const src = fs.readFileSync(path.join(__dirname, '..', 'signup-hotmail.js'), 'utf8');
-const fn = src.match(/async function typeHuman\(page, selector, text\) \{[\s\S]*?\n\}/)[0];
-const typeHuman = new Function(`return ${fn}`)();
-
-// Fake page that drops every character after `cap`, reproducing the React-rerender truncation.
-function makePage(cap) {
-  let value = '';
-  const p = {
-    fills: 0,
-    async click() {},
-    async fill(_sel, v) { value = v; p.fills++; },
-    async inputValue() { return value; },
-    keyboard: { async type(ch) { if (value.length < cap) value += ch; } },
-  };
-  return p;
-}
+// typeHuman lives in human-behavior.js and drives real mouse and keyboard events, so it is
+// exercised against a real page rather than a stub. The fixture reproduces the failure that
+// prompted the repair path: a field that stops accepting typed characters partway through,
+// which once produced a truncated email and a sign-in that failed three steps later.
+const base = pathToFileURL(path.join(__dirname, 'fixtures', 'truncating-input.html')).href;
+const EMAIL = 'averylongtestaddress99@example.com'; // 34 chars
 
 (async () => {
-  const EMAIL = 'averylongtestaddress99@example.com';
+  const browser = await chromium.launch();
 
-  // 1. Healthy field: typed through, no repair needed.
-  const ok = makePage(Infinity);
-  await typeHuman(ok, '#e', EMAIL);
-  assert.strictEqual(await ok.inputValue(), EMAIL);
-  assert.strictEqual(ok.fills, 1, 'only the initial clear');
-  console.log('✓ untruncated input needs no repair');
+  // Healthy field: everything typed lands, no repair needed.
+  {
+    const page = await browser.newPage({ viewport: { width: 900, height: 600 } });
+    await page.goto(base);
+    await typeHuman(page, '#field', EMAIL);
+    assert.strictEqual(await page.locator('#field').inputValue(), EMAIL);
+    console.log('✓ types the full value into a healthy field');
+    await page.close();
+  }
 
-  // 2. The observed failure: truncated at 10 chars -> repaired via fill().
-  const trunc = makePage(10);
-  await typeHuman(trunc, '#e', EMAIL);
-  assert.strictEqual(await trunc.inputValue(), EMAIL);
-  assert.strictEqual(trunc.fills, 2, 'clear + repair');
-  console.log('✓ truncation at 10 chars is detected and repaired');
+  // The observed failure: the field accepts only the first 10 of 34 characters.
+  {
+    const page = await browser.newPage({ viewport: { width: 900, height: 600 } });
+    await page.goto(`${base}?cap=10`);
+    await typeHuman(page, '#field', EMAIL);
+    assert.strictEqual(
+      await page.locator('#field').inputValue(), EMAIL,
+      'truncation must be detected and repaired, not passed downstream',
+    );
+    console.log('✓ detects truncation at 10 of 34 chars and repairs it');
+    await page.close();
+  }
 
-  // 3. Field that refuses writes entirely must throw, not proceed silently.
-  const dead = { ...makePage(0), async fill() {}, async inputValue() { return ''; } };
-  dead.click = async () => {};
-  dead.keyboard = { async type() {} };
-  await assert.rejects(() => typeHuman(dead, '#e', EMAIL), /Could not set #e/);
-  console.log('✓ unwritable field throws instead of failing silently');
+  // A field that refuses writes entirely must throw rather than let the caller proceed on a
+  // value that was never set.
+  {
+    const page = await browser.newPage({ viewport: { width: 900, height: 600 } });
+    // maxlength caps the repair path as well, so the value genuinely cannot be stored.
+    await page.goto(`${base}?maxlength=5`);
+    await assert.rejects(() => typeHuman(page, '#field', EMAIL), /Could not set/);
+    assert.notStrictEqual(await page.locator('#field').inputValue(), EMAIL);
+    console.log('✓ an unwritable field throws instead of failing silently');
+    await page.close();
+  }
 
+  await browser.close();
   console.log('\nAll assertions passed.');
 })().catch((e) => { console.error('FAILED:', e.message); process.exit(1); });

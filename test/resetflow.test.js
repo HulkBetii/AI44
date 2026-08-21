@@ -7,8 +7,7 @@ const { chromium } = require('playwright');
 // Covers the "Forgot your password?" request form. The new-password form that the emailed
 // link opens is covered separately in newpassword.test.js.
 const src = fs.readFileSync(path.join(__dirname, '..', 'signup-hotmail.js'), 'utf8');
-const typeHuman = new Function(
-  `return ${src.match(/async function typeHuman\(page, selector, text\) \{[\s\S]*?\n\}/)[0]}`)();
+const { typeHuman } = require('../human-behavior.js');
 const firstPresent = new Function(
   `return ${src.match(/async function firstPresent\(page, selectors, what\) \{[\s\S]*?\n\}/)[0]}`)();
 

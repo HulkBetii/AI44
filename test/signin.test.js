@@ -4,16 +4,16 @@ const path = require('path');
 const { pathToFileURL } = require('url');
 const { chromium } = require('playwright');
 
+const { typeHuman, clickHuman } = require('../human-behavior.js');
 const src = fs.readFileSync(path.join(__dirname, '..', 'signup-hotmail.js'), 'utf8');
 const pick = (re) => src.match(re)[0];
 const bundle = [
   pick(/const SIGN_IN = \{[^}]*\};/),
-  pick(/async function typeHuman\(page, selector, text\) \{[\s\S]*?\n\}/),
   pick(/function firstOutcome\(candidates, timeoutMs\) \{[\s\S]*?\n\}/),
   pick(/async function attemptSignIn\(page, email, elevenPassword\) \{[\s\S]*?\n\}/),
   'return { attemptSignIn, SIGN_IN };',
 ].join('\n');
-const { attemptSignIn, SIGN_IN } = new Function('step', bundle)(() => {});
+const { attemptSignIn, SIGN_IN } = new Function('step', 'typeHuman', 'clickHuman', bundle)(() => {}, typeHuman, clickHuman);
 
 const url = (mode) =>
   pathToFileURL(path.join(__dirname, 'fixtures', 'signin', 'sign-in.html')).href + '?mode=' + mode;

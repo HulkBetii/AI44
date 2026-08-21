@@ -1,10 +1,13 @@
 const http = require('http');
 
-const API_BASE = 'http://127.0.0.1:19995';
+// GPM assigns this port per installation - its own docs tell you to read it from the app's
+// API tab, and their examples show 19955 and 50615. 19995 is correct on this machine, so it
+// stays the default, but hardcoding it outright would break silently anywhere else.
+const API_BASE = process.env.GPM_API_BASE || 'http://127.0.0.1:19995';
 
-function callApi(endpoint) {
+function callApi(endpoint, timeoutMs = 15000) {
   return new Promise((resolve, reject) => {
-    http.get(`${API_BASE}${endpoint}`, (res) => {
+    const req = http.get(`${API_BASE}${endpoint}`, (res) => {
       let data = '';
       res.on('data', (chunk) => { data += chunk; });
       res.on('end', () => {
@@ -22,6 +25,13 @@ function callApi(endpoint) {
       });
     }).on('error', (e) => {
       reject(new Error(`Failed to call GPM API at ${endpoint}: ${e.message}`));
+    });
+
+    // http.get applies no timeout of its own. These calls sit at the top of every account
+    // iteration, before any bell or tick output exists, so a GPM app that accepts the socket
+    // without replying would stop the whole batch with nothing on screen to say why.
+    req.setTimeout(timeoutMs, () => {
+      req.destroy(new Error(`GPM API timed out after ${timeoutMs}ms calling ${endpoint}`));
     });
   });
 }

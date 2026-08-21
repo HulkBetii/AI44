@@ -1,0 +1,34 @@
+<!doctype html><html><body style="margin:0;font-family:sans-serif">
+<div style="padding:20px">
+  <button id="gated" disabled>Submit</button>
+  <span id="gatedState">not-clicked</span>
+  <input id="gate" placeholder="type to enable">
+</div>
+<div style="height:2000px;background:#eee">spacer forcing the next button below the fold</div>
+<button id="belowFold">Far Below</button>
+<span id="belowState">not-clicked</span>
+<script>
+const gated = document.getElementById('gated');
+// Mirrors the real ElevenLabs forms: the button unlocks only once the field validates.
+document.getElementById('gate').addEventListener('input', (e) => {
+  gated.disabled = e.target.value.length === 0;
+});
+gated.addEventListener('click', () => {
+  document.getElementById('gatedState').textContent = 'CLICKED';
+});
+document.getElementById('belowFold').addEventListener('click', () => {
+  document.getElementById('belowState').textContent = 'CLICKED';
+});
+
+// An overlay covering a target, like Outlook's cookie consent modal covering the message
+// list: the element is present, visible and enabled, but pointer events never reach it.
+if (new URLSearchParams(location.search).get('overlay')) {
+  const o = document.createElement('div');
+  o.id = 'overlay';
+  o.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:9999';
+  document.body.appendChild(o);
+  const after = Number(new URLSearchParams(location.search).get('overlayGoesAfter') || 0);
+  if (after) setTimeout(() => o.remove(), after);
+}
+</script>
+</body></html>

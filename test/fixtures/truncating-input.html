@@ -1,0 +1,24 @@
+<!doctype html><html><body style="margin:0;font-family:sans-serif">
+<div style="padding:20px">
+  <input id="field" style="width:400px;height:30px">
+</div>
+<script>
+// Reproduces the React re-render that silently dropped keystrokes in production: characters
+// arriving as real key events stop being accepted past the cap, while a direct value set
+// (page.fill, which fires no keydown) still gets through - exactly the asymmetry the repair
+// path in typeHuman relies on.
+const params = new URLSearchParams(location.search);
+const CAP = Number(params.get('cap') ?? Infinity);
+// A real maxlength caps direct value-setting too, so even the repair path cannot win - the
+// case where typeHuman must give up loudly rather than report a value it never stored.
+if (params.get('maxlength')) {
+  document.getElementById('field').setAttribute('maxlength', params.get('maxlength'));
+}
+let typed = 0;
+document.getElementById('field').addEventListener('keydown', (e) => {
+  if (e.key.length !== 1) return;
+  typed++;
+  if (typed > CAP) e.preventDefault();
+});
+</script>
+</body></html>

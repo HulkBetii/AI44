@@ -5,8 +5,11 @@ const { pathToFileURL } = require('url');
 const { chromium } = require('playwright');
 
 const src = fs.readFileSync(path.join(__dirname, '..', 'signup-hotmail.js'), 'utf8');
-const generatePassword = new Function(
-  `return ${src.match(/function generatePassword\(\) \{[\s\S]*?\n\}/)[0]}`)();
+const { generateRealisticName } = require('../human-behavior.js');
+// generatePassword still lives in signup-hotmail.js but now depends on a module import,
+// so inject it rather than hoisting the whole module.
+const generatePassword = new Function('generateRealisticName',
+  `return ${src.match(/function generatePassword\(\) \{[\s\S]*?\n\}/)[0]}`)(generateRealisticName);
 
 const url = pathToFileURL(path.join(__dirname, 'fixtures', 'reset', 'new-password.html')).href;
 

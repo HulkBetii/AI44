@@ -20,22 +20,6 @@ function randomGaussian(min, max) {
 }
 
 /**
- * Sinh phân bố Poisson (mô phỏng delay hành vi biến thiên)
- * Mượn tạm cơ chế Gamma/Log để sinh độ trễ tự nhiên.
- */
-function poissonDelay(averageMs) {
-  const L = Math.exp(-averageMs);
-  let p = 1.0;
-  let k = 0;
-  do {
-    k++;
-    p *= Math.random();
-  } while (p > L && k < averageMs * 2);
-  // Thực tế để code nhẹ nhàng, ta dùng phân phối chuẩn (Gaussian) lệch phải cho thời gian nghĩ.
-  return randomGaussian(averageMs * 0.8, averageMs * 1.5);
-}
-
-/**
  * Tạm dừng (Thinking Time)
  */
 async function think(minMs = 1500, maxMs = 3500) {
@@ -75,27 +59,112 @@ function generateBezierCurve(startX, startY, endX, endY, steps = 30) {
 }
 
 /**
+ * Điểm sắp click có thực sự thuộc về element mục tiêu không, hay đang bị thứ khác che.
+ */
+async function isCovered(locator, x, y) {
+  return locator.evaluate((node, pt) => {
+    const top = document.elementFromPoint(pt.x, pt.y);
+    if (!top) return true;
+    return !(top === node || node.contains(top) || top.contains(node));
+  }, { x, y }).catch(() => false);
+}
+
+/**
+ * Đưa vị trí chuột về trong viewport nếu nó đang nằm ngoài.
+ * CDP-attached pages thường trả về viewportSize() null, nên phải hỏi chính trang.
+ */
+async function reseedMouseIfOutsideViewport(page) {
+  const size = page.viewportSize()
+    || await page.evaluate(() => ({ width: window.innerWidth, height: window.innerHeight }))
+      .catch(() => null);
+  if (!size) return;
+
+  const inside = lastMousePos.x >= 0 && lastMousePos.x < size.width
+    && lastMousePos.y >= 0 && lastMousePos.y < size.height;
+  if (inside) return;
+
+  lastMousePos = {
+    x: Math.random() * size.width,
+    y: Math.random() * size.height,
+  };
+}
+
+/**
  * Di chuyển chuột và Click như người thật (Fitts's Law, Bezier, Jitter, Overshoot)
  * @param {object} page
  * @param {string|object} selectorOrLocator Chuỗi selector hoặc đối tượng Locator của Playwright
  */
-async function clickHuman(page, selectorOrLocator) {
+async function clickHuman(page, selectorOrLocator, { timeoutMs = 30000 } = {}) {
   let locator;
   if (typeof selectorOrLocator === 'string') {
-    await page.waitForSelector(selectorOrLocator, { state: 'visible' });
+    await page.waitForSelector(selectorOrLocator, { state: 'visible', timeout: timeoutMs });
     locator = page.locator(selectorOrLocator).first();
   } else {
     locator = selectorOrLocator;
   }
-  
+
+  // Raw page.mouse events bypass every actionability check locator.click() performs, so the
+  // two that this pipeline depends on have to be reproduced here.
+
+  // 1. boundingBox() does not scroll: it reports coordinates relative to the viewport and may
+  //    return values outside it, in which case the mouse would be driven to empty space.
+  await locator.scrollIntoViewIfNeeded({ timeout: timeoutMs }).catch(() => {});
+
+  // 2. Several ElevenLabs buttons ship disabled until their form validates. Clicking during
+  //    that window does nothing at all, and returning as though it worked sends the caller
+  //    off to blame a later step for the failure.
+  const deadline = Date.now() + timeoutMs;
+  while (!(await locator.isEnabled().catch(() => false))) {
+    if (Date.now() > deadline) {
+      const label = typeof selectorOrLocator === 'string' ? selectorOrLocator : 'target';
+      throw new Error(`clickHuman: ${label} never became enabled within ${timeoutMs}ms`);
+    }
+    await new Promise((r) => setTimeout(r, 100));
+  }
+
   const box = await locator.boundingBox();
   if (!box) throw new Error(`Could not find bounding box for target`);
+
+  // The stored position belongs to whichever page was clicked last. With a fresh browser per
+  // account that may be outside this viewport entirely, which would start the path off-screen.
+  await reseedMouseIfOutsideViewport(page);
 
   // Chọn điểm target bất kỳ bên trong khung hình (tránh viền)
   const padX = Math.max(1, box.width * 0.1);
   const padY = Math.max(1, box.height * 0.1);
-  const targetX = box.x + padX + Math.random() * (box.width - padX * 2);
-  const targetY = box.y + padY + Math.random() * (box.height - padY * 2);
+  const randomX = box.x + padX + Math.random() * (box.width - padX * 2);
+  const randomY = box.y + padY + Math.random() * (box.height - padY * 2);
+  const centreX = box.x + box.width / 2;
+  const centreY = box.y + box.height / 2;
+
+  // 3. locator.click() also checks the element actually receives pointer events. Outlook's
+  //    cookie modal covered the message list while the rows stayed present, visible and
+  //    enabled, so raw mouse events landed on the overlay and the click did nothing.
+  //
+  //    A partial overlap needs a different answer from a full one: ElevenLabs puts a
+  //    show/hide button over the right edge of its password fields, so a random point can be
+  //    covered while the field is perfectly clickable elsewhere. Try points sliding from the
+  //    random one toward the centre first, and only treat it as blocked if none is free.
+  //    Overlays are also often transient, so wait one out before giving up.
+  const candidates = [0, 0.4, 0.7, 1].map((t) => ({
+    x: randomX + (centreX - randomX) * t,
+    y: randomY + (centreY - randomY) * t,
+  }));
+
+  let point = null;
+  for (;;) {
+    for (const c of candidates) {
+      if (!await isCovered(locator, c.x, c.y)) { point = c; break; }
+    }
+    if (point) break;
+    if (Date.now() > deadline) {
+      throw new Error(
+        `clickHuman: target at (${Math.round(centreX)},${Math.round(centreY)}) is covered by another element`);
+    }
+    await new Promise((r) => setTimeout(r, 200));
+  }
+  const targetX = point.x;
+  const targetY = point.y;
 
   // Sinh quỹ đạo Bezier
   const steps = randomGaussian(20, 40);
@@ -231,7 +300,6 @@ function generateRealisticName() {
 
 module.exports = {
   randomGaussian,
-  poissonDelay,
   think,
   clickHuman,
   typeHuman,
