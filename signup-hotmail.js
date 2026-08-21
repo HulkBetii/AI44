@@ -242,6 +242,16 @@ async function loginMicrosoft(ctx, hotmailEmail, hotmailPassword) {
 // The CAPTCHA is solved by hand, and this is the only point in a run that needs a person.
 // Ring the terminal bell and raise the window so the wait can be spent elsewhere, then tick
 // every 30s so a live wait is distinguishable from a hung one.
+// A third outcome the sign-up wait had no branch for. When ElevenLabs refuses the address -
+// most often because an earlier attempt already registered it - it reports the reason inline
+// and stays on /sign-up with no Resend button, so neither of the other two branches can ever
+// fire. The run then sat out the full 15 minutes while the console kept asking for a CAPTCHA
+// that was not on the screen.
+//
+// Deliberately narrow. "Already have an account? Log in" is standing text on this very page,
+// so anything looser than this would abort every signup instead of the rejected ones.
+const SIGNUP_REJECTED = /already (?:in use|registered|exists|taken)|has already been (?:registered|taken|used)|account (?:already )?exists/i;
+
 async function waitForManualSignup(page) {
   const BELL = String.fromCharCode(7);
   const TICK_MS = 30000;
@@ -267,7 +277,28 @@ async function waitForManualSignup(page) {
         .then(() => 'url-changed').catch(() => null),
       page.waitForSelector('button:has-text("Resend")', { timeout: SIGNUP_TIMEOUT_MS })
         .then(() => 'resend-shown').catch(() => null),
+      // Interval polling rather than the default rAF: a backgrounded tab stops animation
+      // frames, which is exactly the state this branch has to keep working in.
+      page.waitForFunction(
+        (source) => new RegExp(source, 'i').test(document.body.innerText || ''),
+        SIGNUP_REJECTED.source,
+        { timeout: SIGNUP_TIMEOUT_MS, polling: 500 },
+      ).then(() => 'rejected').catch(() => null),
     ]);
+    if (settled === 'rejected') {
+      // Quote what the page actually said. The regex is a guess at ElevenLabs' wording, so the
+      // real sentence is what tells the operator whether it guessed right.
+      const said = await page.evaluate((source) => {
+        const re = new RegExp(source, 'i');
+        return (document.body.innerText || '').split('\n')
+          .map((l) => l.trim()).find((l) => re.test(l)) || '';
+      }, SIGNUP_REJECTED.source).catch(() => '');
+      // Tagged, not just worded: the caller classifies on this to pick a recovery, and
+      // matching on message text would break the moment the wording changed.
+      const refused = new Error(`ElevenLabs refused the address: ${said || '(message not captured)'}`);
+      refused.code = 'ALREADY_REGISTERED';
+      throw refused;
+    }
     if (!settled) {
       throw new Error(`Signup timed out after ${totalSec}s (still at ${page.url()})`);
     }
@@ -1036,7 +1067,10 @@ async function run() {
     console.log(`Re-keying ${pendingRows.length} account(s): rows ${rows.join(', ')}`);
   } else if (resetPassword) {
     // Rows --resume gave up on: the account exists but the stored password does not open it.
-    pendingRows = (await loadRows()).filter((r) => r.status === 'credentials-rejected');
+    // 'already-registered' belongs here too - sign-up found the address taken, so an account
+    // exists whose password was never recorded, and a reset is the only way back into it.
+    const RESETTABLE = ['credentials-rejected', 'already-registered'];
+    pendingRows = (await loadRows()).filter((r) => RESETTABLE.includes(r.status));
     console.log(`Loaded ${pendingRows.length} account(s) needing a password reset`);
   } else if (resume) {
     pendingRows = (await loadRows()).filter(
@@ -1155,7 +1189,15 @@ async function run() {
       const isNetworkError = /net::ERR_/.test(err.message || '');
       const isInactive = !resume && !resetPassword && !regenerateKey
         && currentStep.startsWith('MS login') && !isNetworkError;
-      const failStatus = isNetworkError ? 'failed:network' : isInactive ? 'inactive' : `failed:${currentStep}`;
+      // A refused address and an unsolved CAPTCHA both fail on the sign-up step, but they need
+      // opposite recoveries: one is a plain retry, the other means an ElevenLabs account
+      // already exists whose password was never recorded, so only --reset-password can reach
+      // it. Sharing one 'failed:<step>' label would hide that, exactly as network failures
+      // once hid behind 'inactive'.
+      const failStatus = err.code === 'ALREADY_REGISTERED' ? 'already-registered'
+        : isNetworkError ? 'failed:network'
+        : isInactive ? 'inactive'
+        : `failed:${currentStep}`;
 
       // Status column only. Never blank F/G here: the ElevenLabs account may already exist
       // with its password recorded, and losing it would orphan the account for good.

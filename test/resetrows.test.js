@@ -15,6 +15,8 @@ const { parseArgs, selectRows } = require('../reset-rows.js');
 // different kinds of failure that used to be indistinguishable to this tool.
 const SHEET = [
   { rowIndex: 2,  email: 'done@x.com',    status: 'complete',                  apiKey: 'sk_aaa', elevenPass: 'p' },
+  { rowIndex: 5,  email: 'badpass@x.com', status: 'credentials-rejected',      apiKey: '',       elevenPass: 'p' },
+  { rowIndex: 6,  email: 'taken@x.com',   status: 'already-registered',        apiKey: '',       elevenPass: '' },
   { rowIndex: 19, email: 'dead1@x.com',   status: 'need to recover password',  apiKey: '',       elevenPass: '' },
   { rowIndex: 20, email: 'dead2@x.com',   status: 'need to recover password',  apiKey: '',       elevenPass: '' },
   { rowIndex: 25, email: 'signup@x.com',  status: 'failed:sign-up elevenlabs', apiKey: '',       elevenPass: '' },
@@ -56,7 +58,8 @@ console.log('✓ --apply and --force parsed');
 
 // ── selectRows ───────────────────────────────────────────────────────────────
 
-// Default behaviour is unchanged: every stale row, minus any that would lose a key.
+// Default behaviour: every stale row, minus any that would lose a key and minus those with a
+// dedicated recovery.
 {
   const { candidates, withheld } = selectRows(SHEET, {});
   assert.deepStrictEqual(candidates.map(idx), [19, 20, 25, 30]);
@@ -64,6 +67,31 @@ console.log('✓ --apply and --force parsed');
   assert.ok(!candidates.some((r) => r.status === 'complete'), 'a complete row is never reset');
   assert.ok(!candidates.some((r) => r.status === 'pending'), 'an already-queued row is not touched');
   console.log('✓ default selects every stale row and withholds the one holding a key');
+}
+
+// Sweeping these back to 'pending' is wrong twice: it clears the password in column G, and it
+// re-runs a sign-up ElevenLabs refuses because the account exists - so the row returns here
+// next run. --reset-password is the route that actually works on them.
+{
+  const { candidates, deferred } = selectRows(SHEET, {});
+  assert.deepStrictEqual(deferred.map(idx), [5, 6]);
+  for (const n of [5, 6]) {
+    assert.ok(!candidates.map(idx).includes(n), `row ${n} must not be swept back to pending`);
+  }
+  console.log('✓ statuses with their own recovery are left out of the blind sweep');
+}
+
+// Held back from the sweep, not made unreachable. Naming one by row used to work while naming
+// it by status silently found nothing - the two routes have to agree.
+{
+  assert.deepStrictEqual(selectRows(SHEET, { rows: [6] }).candidates.map(idx), [6]);
+  assert.deepStrictEqual(
+    selectRows(SHEET, { statuses: ['already-registered'] }).candidates.map(idx), [6],
+    '--status must reach a deferred row exactly as --rows does',
+  );
+  assert.deepStrictEqual(
+    selectRows(SHEET, { statuses: ['credentials-rejected'] }).candidates.map(idx), [5]);
+  console.log('✓ naming a deferred row reaches it, by row or by status alike');
 }
 
 // The case the filters were added for: rescue the clean retry without re-queueing the four

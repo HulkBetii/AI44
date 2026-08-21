@@ -47,13 +47,24 @@ function parseArgs(argv) {
   return { apply, force, rows, statuses };
 }
 
+// Statuses that already have a dedicated recovery, so sweeping them back to 'pending' is
+// wrong twice over: it clears the stored password in column G, and it re-runs a sign-up that
+// ElevenLabs will refuse because the account exists - the row lands straight back here. Both
+// are handled by `signup-hotmail.js --reset-password`. Still selectable by name, for an
+// operator who has decided the account really is beyond saving.
+const HAS_OWN_RECOVERY = ['credentials-rejected', 'already-registered'];
+
 // Pure: decides what would be written, so the guards can be tested without a spreadsheet.
 // Returns the rows to reset plus whatever was withheld and why, for main() to report.
 function selectRows(all, { rows = null, statuses = null, force = false } = {}) {
   const stale = all.filter((r) => r.status !== 'complete' && r.status !== 'pending');
   const present = [...new Set(stale.map((r) => r.status || '(blank)'))].sort();
+  const deferred = stale.filter((r) => HAS_OWN_RECOVERY.includes(r.status));
 
-  let pool = stale;
+  // Held back from the unfiltered sweep only. Naming one - by row or by status - is the
+  // operator saying they know, so both routes must reach it or the two disagree: --rows=6
+  // would work while --status=already-registered silently found nothing.
+  let pool = (rows || statuses) ? stale : stale.filter((r) => !HAS_OWN_RECOVERY.includes(r.status));
 
   if (rows) {
     const missing = rows.filter((n) => !all.some((r) => r.rowIndex === n));
@@ -76,7 +87,7 @@ function selectRows(all, { rows = null, statuses = null, force = false } = {}) {
   if (statuses) pool = pool.filter((r) => statuses.includes(r.status));
 
   if (pool.length === 0) {
-    return { candidates: [], withheld: [], present, stale, reason: statuses ? 'no-match' : 'nothing' };
+    return { candidates: [], withheld: [], present, stale, deferred, reason: statuses ? 'no-match' : 'nothing' };
   }
 
   // A non-complete row holding an API key means the key was created but the status write
@@ -86,7 +97,7 @@ function selectRows(all, { rows = null, statuses = null, force = false } = {}) {
   const candidates = force ? pool : pool.filter((r) => !r.apiKey);
 
   return {
-    candidates, withheld, present, stale,
+    candidates, withheld, present, stale, deferred,
     reason: candidates.length === 0 ? 'all-withheld' : null,
   };
 }
@@ -96,12 +107,21 @@ async function main() {
 
   await initSheets();
   const all = await loadRows();
-  const { candidates, withheld, present, stale, reason } = selectRows(all, { rows, statuses, force });
+  const { candidates, withheld, present, stale, deferred, reason } = selectRows(all, { rows, statuses, force });
 
   console.log(`Total rows: ${all.length}`);
   console.log(`  complete: ${all.filter((r) => r.status === 'complete').length}`);
   console.log(`  pending:  ${all.filter((r) => r.status === 'pending').length}`);
   console.log(`  stale:    ${stale.length}`);
+
+  // Named, not hidden: skipping these silently would look like the tool simply missed them.
+  if (deferred.length > 0 && !rows && !statuses) {
+    console.log(`\n${deferred.length} row(s) have their own recovery and are left alone here:`);
+    for (const r of deferred) {
+      console.log(`  row ${String(r.rowIndex).padStart(3)}  ${r.email.padEnd(34)} ${r.status}`);
+    }
+    console.log('  → run: node signup-hotmail.js --reset-password');
+  }
 
   if (reason === 'no-match') {
     // Naming a status that matches nothing is almost always a typo, so show what is actually

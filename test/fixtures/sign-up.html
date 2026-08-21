@@ -1,0 +1,49 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Sign up</title>
+<body>
+  <main>
+    <h1>Create your account</h1>
+    <form>
+      <input data-testid="sign-up-email-input" type="email" placeholder="Email">
+      <input data-testid="sign-up-password-input" type="password" placeholder="Password">
+      <button style="view-transition-name: submit">Sign up</button>
+    </form>
+
+    <!-- Standing text on the real page. It contains the word "already", which is why the
+         rejection matcher has to be narrow enough not to fire on it. -->
+    <p>Already have an account? <a href="/app/sign-in">Log in</a></p>
+
+    <div id="slot"></div>
+  </main>
+
+  <script>
+    const p = new URLSearchParams(location.search);
+    const after = Number(p.get('after') || 300);
+
+    // ?reject=<text> renders an inline error and stays on this page - no Resend, no
+    // navigation, which is the state that used to hang for the full timeout.
+    if (p.has('reject')) {
+      setTimeout(() => {
+        const el = document.createElement('p');
+        el.setAttribute('role', 'alert');
+        el.textContent = p.get('reject');
+        document.getElementById('slot').append(el);
+      }, after);
+    }
+
+    // ?resend=1 is the normal happy path: the verification screen appears.
+    if (p.has('resend')) {
+      setTimeout(() => {
+        const b = document.createElement('button');
+        b.textContent = 'Resend';
+        document.getElementById('slot').append(b);
+      }, after);
+    }
+
+    // ?navigate=1 is the other happy path: the app moves off /sign-up.
+    if (p.has('navigate')) {
+      setTimeout(() => { location.href = location.href.replace('sign-up', 'onboarding'); }, after);
+    }
+  </script>
+</body>
