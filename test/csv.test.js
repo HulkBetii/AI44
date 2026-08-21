@@ -9,11 +9,12 @@ const path = require('path');
 const src = fs.readFileSync(path.join(__dirname, '..', 'signup-hotmail.js'), 'utf8');
 
 const SUCCESS_CSV = path.join(os.tmpdir(), `success-test-${process.pid}.csv`);
-const build = () => new Function('fs', 'SUCCESS_CSV', 'Q', `
+const KEYS_TXT = path.join(os.tmpdir(), `keys-test-${process.pid}.txt`);
+const build = () => new Function('fs', 'SUCCESS_CSV', 'KEYS_TXT', 'Q', `
   ${src.match(/function csvCell\(value\) \{[\s\S]*?\n\}/)[0]}
   ${src.match(/function appendSuccessCSV\([\s\S]*?\n\}/)[0]}
   return appendSuccessCSV;
-`)(fs, SUCCESS_CSV, String.fromCharCode(34));
+`)(fs, SUCCESS_CSV, KEYS_TXT, String.fromCharCode(34));
 
 const appendSuccessCSV = build();
 
@@ -37,7 +38,7 @@ function parseCsv(text) {
   return rows;
 }
 
-try { fs.unlinkSync(SUCCESS_CSV); } catch {}
+for (const f of [SUCCESS_CSV, KEYS_TXT]) { try { fs.unlinkSync(f); } catch {} }
 
 // A password containing a comma is the case that silently corrupted every later column.
 appendSuccessCSV(
@@ -77,5 +78,11 @@ const guardSrc = src.match(/cred\.apiKey = null;\s*\n\s*cred\.elevenPassword = n
 assert.ok(guardSrc, 'per-run reset of cred.apiKey/elevenPassword is missing from the loop');
 console.log('✓ the run loop clears cred.apiKey before each account');
 
-try { fs.unlinkSync(SUCCESS_CSV); } catch {}
+// keys.txt is a second sink for the same secret, so it gets the same treatment: one key
+// per line, in order.
+const keyLines = fs.readFileSync(KEYS_TXT, 'utf8').trim().split('\n');
+assert.deepStrictEqual(keyLines, ['sk_abc123', 'sk_def456']);
+console.log('✓ keys.txt receives one key per line');
+
+for (const f of [SUCCESS_CSV, KEYS_TXT]) { try { fs.unlinkSync(f); } catch {} }
 console.log('\nAll assertions passed.');
