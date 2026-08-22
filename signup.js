@@ -103,6 +103,15 @@ function generatePassword() {
   return Array.from({ length: 6 }, () => rand(letters)).join('') + rand(numbers) + rand(specials);
 }
 
+function safePageLocation(page) {
+  try {
+    const url = new URL(page.url());
+    return `${url.origin}${url.pathname}`;
+  } catch {
+    return '[unknown page]';
+  }
+}
+
 // Human-like typing
 async function typeHuman(page, selector, text) {
   await page.click(selector);
@@ -123,7 +132,7 @@ async function run() {
   account = { email, password, mailboxPassword, mailboxToken: mailToken, apiKey: null };
 
   console.log(`✅ Email: ${email}`);
-  console.log(`✅ Password: ${password}`);
+  console.log('✅ Password generated and stored securely.');
 
   // ── STEP 2: Launch real Chrome with copied user profile ────────────────────
   const CHROME_EXE = 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe';
@@ -184,7 +193,7 @@ async function run() {
 
   // ── STEP 4: Handle CAPTCHA if present ──────────────────────────────────────
   step('4/10 wait for signup to clear (CAPTCHA may need manual solving)');
-  console.log(`[4] URL after submit: ${page.url()}`);
+  console.log(`[4] Page after submit: ${safePageLocation(page)}`);
 
   // Still on the signup page means the submit has not gone through yet.
   if (page.url().includes('sign-up')) {
@@ -199,22 +208,22 @@ async function run() {
         .then(() => 'resend-shown').catch(() => null),
     ]);
     if (!settled) {
-      throw new Error(`Signup did not complete within ${SIGNUP_TIMEOUT_MS}ms (still at ${page.url()})`);
+      throw new Error(`Signup did not complete within ${SIGNUP_TIMEOUT_MS}ms (still at ${safePageLocation(page)})`);
     }
-    console.log(`[4] Signup complete (${settled}). URL: ${page.url()}`);
+    console.log(`[4] Signup complete (${settled}). Page: ${safePageLocation(page)}`);
   }
 
   // ── STEP 5: Poll mail.tm for verify email ──────────────────────────────────
   step('5/10 poll mail.tm for verification email');
   const verifyUrl = await pollMailTmInbox(mailToken, INBOX_TIMEOUT_MS);
-  console.log('[5] Verify URL found:', verifyUrl.substring(0, 80) + '...');
+  console.log('[5] Verify URL found securely.');
 
   // ── STEP 6: Open verify URL ─────────────────────────────────────────────────
   step('6/10 open verify URL');
   const verifyPage = await context.newPage();
   activePage = verifyPage;
   await verifyPage.goto(verifyUrl, { waitUntil: 'domcontentloaded' });
-  console.log(`[4] URL: ${verifyPage.url()}`);
+  console.log(`[4] Verification page: ${safePageLocation(verifyPage)}`);
 
   // ── STEP 7: Click Continue ──────────────────────────────────────────────────
   step('7/10 click Continue');
@@ -324,14 +333,14 @@ async function run() {
     apiKey = await verifyPage.evaluate(() => navigator.clipboard.readText()).catch(() => '');
   }
   if (!apiKey.startsWith('sk_')) {
-    throw new Error(`API key not captured (got: ${JSON.stringify(apiKey)})`);
+    throw new Error('API key was not captured in the expected format');
   }
-  console.log(`[10] API Key: ${apiKey}`);
+  console.log('[10] API key captured securely.');
 
   console.log(`\n✅ Done!`);
   console.log(`   Email: ${email}`);
-  console.log(`   Password: ${password}`);
-  console.log(`   API Key: ${apiKey}`);
+  console.log('   Password: [REDACTED]');
+  console.log('   API Key: [REDACTED]');
 
   account = { ...account, apiKey, apiKeyName: keyName, firstName, status: 'complete' };
   saveAccount(account);
@@ -354,7 +363,7 @@ async function captureFailure(err) {
   }
   // Page state at the moment of failure is the only thing that explains a selector timeout.
   try {
-    console.error(`[debug] URL: ${activePage.url()}`);
+    console.error(`[debug] Page: ${safePageLocation(activePage)}`);
     const text = await activePage.evaluate(() => document.body.innerText.slice(0, 800));
     console.error(`[debug] Visible text:\n${text}`);
     await activePage.screenshot({ path: FAILURE_SCREENSHOT, fullPage: true });

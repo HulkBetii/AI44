@@ -12,6 +12,7 @@
 
 const { spawn } = require('child_process');
 const path = require('path');
+const { withAutomationLock } = require('./automation-lock');
 
 const SCRIPT = path.join(__dirname, 'signup-hotmail.js');
 
@@ -25,7 +26,11 @@ const PASSES = [
 
 function run(args) {
   return new Promise((resolve) => {
-    const child = spawn(process.execPath, [SCRIPT, ...args], { cwd: __dirname, stdio: 'inherit' });
+    const child = spawn(process.execPath, [SCRIPT, ...args], {
+      cwd: __dirname,
+      stdio: 'inherit',
+      env: { ...process.env, MAIL_TEMP_LOCK_HELD: '1' },
+    });
     child.on('close', resolve);
     child.on('error', (err) => {
       console.error(`[batch] could not start pass: ${err.message}`);
@@ -34,11 +39,14 @@ function run(args) {
   });
 }
 
-(async () => {
+withAutomationLock('batch-cli', async () => {
   for (const [i, pass] of PASSES.entries()) {
     console.log(`\n${'━'.repeat(64)}`);
     console.log(`▶ pass ${i + 1}/${PASSES.length}: ${pass.name}`);
-    console.log(`  node signup-hotmail.js ${pass.args.join(' ')}`.trimEnd());
+    const displayArgs = pass.args.map((arg) => arg.startsWith('--proxy-token=')
+      ? '--proxy-token=[REDACTED]'
+      : arg);
+    console.log(`  node signup-hotmail.js ${displayArgs.join(' ')}`.trimEnd());
     console.log('━'.repeat(64));
 
     // Per-account failures are handled inside the script and leave it exiting 0, so a
@@ -52,4 +60,7 @@ function run(args) {
   }
   console.log(`\n${'━'.repeat(64)}`);
   console.log('✅ All passes finished. Check the sheet for any row still not complete.');
-})();
+}).catch((err) => {
+  console.error(`[batch] ${err.message}`);
+  process.exitCode = 1;
+});

@@ -148,6 +148,16 @@ function build({ onStop, onDelete } = {}) {
     console.log('✓ a failed stop does not prevent the delete');
   }
 
+  // A failed delete must keep the profile handle and reject. Starting the next account after
+  // this would violate the exclusive-profile invariant and hide the leaked GPM folder.
+  {
+    const h = build({ onDelete: () => { throw new Error('delete unavailable'); } });
+    h.setProfile('leaked');
+    await assert.rejects(() => h.releaseProfile(), /cleanup failed/);
+    assert.strictEqual(h.getProfile(), 'leaked');
+    console.log('✓ a failed delete blocks progress and keeps the profile available for retry');
+  }
+
   // The signal handler itself: registered for both signals, and it must release before it
   // exits rather than after (there is no "after" - process.exit is immediate).
   {

@@ -5,6 +5,11 @@ const http = require('http');
 // stays the default, but hardcoding it outright would break silently anywhere else.
 const API_BASE = process.env.GPM_API_BASE || 'http://127.0.0.1:19995';
 
+function isMissingProfileResponse(response) {
+  const message = String(response?.message || response?.raw || '');
+  return /not found|does not exist|không (?:tồn tại|tìm thấy)/i.test(message);
+}
+
 function callApi(endpoint, timeoutMs = 15000) {
   return new Promise((resolve, reject) => {
     const req = http.get(`${API_BASE}${endpoint}`, (res) => {
@@ -24,14 +29,14 @@ function callApi(endpoint, timeoutMs = 15000) {
         }
       });
     }).on('error', (e) => {
-      reject(new Error(`Failed to call GPM API at ${endpoint}: ${e.message}`));
+      reject(new Error(`Failed to call GPM API: ${e.message}`));
     });
 
     // http.get applies no timeout of its own. These calls sit at the top of every account
     // iteration, before any bell or tick output exists, so a GPM app that accepts the socket
     // without replying would stop the whole batch with nothing on screen to say why.
     req.setTimeout(timeoutMs, () => {
-      req.destroy(new Error(`GPM API timed out after ${timeoutMs}ms calling ${endpoint}`));
+      req.destroy(new Error(`GPM API timed out after ${timeoutMs}ms`));
     });
   });
 }
@@ -55,7 +60,7 @@ async function createProfile(name, proxy = '') {
   if (res && res.profile_id) {
     return res.profile_id;
   }
-  throw new Error(`Create Profile failed: ${JSON.stringify(res)}`);
+  throw new Error('Create Profile failed');
 }
 
 /**
@@ -78,7 +83,9 @@ async function startProfile(profileId) {
  */
 async function stopProfile(profileId) {
   const endpoint = `/v2/stop?profile_id=${encodeURIComponent(profileId)}`;
-  return await callApi(endpoint);
+  const res = await callApi(endpoint);
+  if (res?.status === false) throw new Error('Stop Profile failed');
+  return res;
 }
 
 /**
@@ -86,7 +93,9 @@ async function stopProfile(profileId) {
  */
 async function deleteProfile(profileId) {
   const endpoint = `/v2/delete?profile_id=${encodeURIComponent(profileId)}&mode=2`;
-  return await callApi(endpoint);
+  const res = await callApi(endpoint);
+  if (res?.status === false && !isMissingProfileResponse(res)) throw new Error('Delete Profile failed');
+  return res;
 }
 
 module.exports = {

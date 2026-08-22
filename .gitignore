@@ -8,3 +8,7 @@ service-account.json
 hotmail.csv
 success_accounts.csv
 keys.txt
+config.local.json
+.runtime/
+dist/
+coverage/

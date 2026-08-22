@@ -32,6 +32,7 @@ const url = 'file://' + path.join(__dirname, 'fixtures', 'sign-up.html').replace
 // "Already have an account?" is standing text on the sign-up page. A looser matcher would
 // abort every signup on sight, which is far worse than the hang it replaces.
 for (const safe of [
+  'Already registered?',
   'Already have an account? Log in',
   'Already a member? Sign in',
   'Create your account',
@@ -39,7 +40,7 @@ for (const safe of [
 ]) {
   assert.ok(!SIGNUP_REJECTED.test(safe), `must not fire on normal page text: ${safe}`);
 }
-console.log('✓ does not fire on "Already have an account?" or other standing text');
+console.log('✓ does not fire on "Already registered?" or other standing text');
 
 for (const rejection of [
   'This email is already in use',
@@ -92,7 +93,7 @@ console.log('✓ fires on the usual phrasings of an already-registered address')
     const wait = build(8000);
     const p = await page('resend=1&after=300');
     assert.strictEqual(await wait(p), 'resend-shown');
-    console.log('✓ the normal verification screen still resolves as resend-shown');
+    console.log('✓ the normal page stays open through its "Already registered?" footer');
     await p.close();
   }
   {

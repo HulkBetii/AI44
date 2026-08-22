@@ -1,7 +1,12 @@
 const { google } = require('googleapis');
+const fs = require('fs');
+const path = require('path');
 
-const SHEET_ID = '1nNAzzC34zSvX2S_AJ4jB6njhKnKRWs8KeZ0mJ5oSkTU';
-const SHEET_NAME = 'hotmail';
+const SHEET_ID = process.env.MAIL_TEMP_SHEET_ID || '1nNAzzC34zSvX2S_AJ4jB6njhKnKRWs8KeZ0mJ5oSkTU';
+const SHEET_NAME = process.env.MAIL_TEMP_SHEET_NAME || 'hotmail';
+let activeSheetId = SHEET_ID;
+let activeSheetName = SHEET_NAME;
+let activeServiceAccountPath = process.env.GOOGLE_SERVICE_ACCOUNT_PATH || null;
 
 // Columns (0-indexed into a row array): A=email B=password C=msaToken D=tenantGuid
 //                                       E=recoveryEmail F=apiKey G=elevenPass H=status I=proxyToken
@@ -13,13 +18,23 @@ const COL = {
 let sheetsClient = null;
 
 function loadCredentials() {
+  const credentialsPath = activeServiceAccountPath
+    ? path.resolve(activeServiceAccountPath)
+    : path.join(__dirname, 'service-account.json');
   try {
-    return require('./service-account.json');
+    return JSON.parse(fs.readFileSync(credentialsPath, 'utf8'));
   } catch {
     throw new Error(
-      'service-account.json not found in the project root. Place the Google service account ' +
-      'key there; it is gitignored and never committed.');
+      `Google service account credentials could not be read at ${credentialsPath}. ` +
+      'Set GOOGLE_SERVICE_ACCOUNT_PATH or place service-account.json in the project root.');
   }
+}
+
+function configureSheets({ sheetId, sheetName, serviceAccountPath } = {}) {
+  if (sheetId) activeSheetId = sheetId;
+  if (sheetName) activeSheetName = sheetName;
+  if (serviceAccountPath) activeServiceAccountPath = serviceAccountPath;
+  sheetsClient = null;
 }
 
 // Credentials are injectable so tests can drive the sheet helpers without a real key file.
@@ -40,8 +55,8 @@ function client() {
 // Returns every data row with its 1-based sheet row index (header occupies row 1).
 async function loadRows() {
   const res = await client().spreadsheets.values.get({
-    spreadsheetId: SHEET_ID,
-    range: `${SHEET_NAME}!A:I`,
+    spreadsheetId: activeSheetId,
+    range: `${activeSheetName}!A:I`,
   });
   const rows = res.data.values || [];
   return rows.slice(1).map((r, i) => ({
@@ -64,8 +79,8 @@ async function loadPendingRows() {
 
 async function writeRange(range, values) {
   await client().spreadsheets.values.update({
-    spreadsheetId: SHEET_ID,
-    range: `${SHEET_NAME}!${range}`,
+    spreadsheetId: activeSheetId,
+    range: `${activeSheetName}!${range}`,
     valueInputOption: 'RAW',
     requestBody: { values: [values] },
   });
@@ -94,11 +109,11 @@ async function updateResult(rowIndex, apiKey, elevenPass, status) {
 async function resetRows(rowIndexes) {
   if (rowIndexes.length === 0) return;
   await client().spreadsheets.values.batchUpdate({
-    spreadsheetId: SHEET_ID,
+    spreadsheetId: activeSheetId,
     requestBody: {
       valueInputOption: 'RAW',
       data: rowIndexes.map((rowIndex) => ({
-        range: `${SHEET_NAME}!F${rowIndex}:H${rowIndex}`,
+        range: `${activeSheetName}!F${rowIndex}:H${rowIndex}`,
         values: [['', '', 'pending']],
       })),
     },
@@ -107,6 +122,7 @@ async function resetRows(rowIndexes) {
 
 module.exports = {
   SHEET_ID, SHEET_NAME, COL,
+  configureSheets,
   initSheets, loadRows, loadPendingRows,
   updateStatus, updatePassword, updateResult, resetRows,
 };

@@ -1,10 +1,19 @@
 {
   "name": "mail-temp",
   "version": "1.0.0",
-  "description": "",
+  "description": "Local operator console for the Hotmail to ElevenLabs automation pipeline",
   "main": "signup-hotmail.js",
   "scripts": {
-    "test": "node test/run-all.js",
+    "dev": "concurrently -k -n server,web -c cyan,green \"npm:dev:server\" \"npm:dev:web\"",
+    "dev:server": "tsx watch src/server/index.ts",
+    "dev:web": "vite --config vite.config.mts",
+    "build": "npm run build:server && npm run build:web",
+    "build:server": "tsc -p tsconfig.server.json",
+    "build:web": "vite build --config vite.config.mts",
+    "start": "node dist/server/index.js",
+    "test": "node test/run-all.js && vitest run",
+    "test:legacy": "node test/run-all.js",
+    "test:new": "vitest run",
     "batch": "node batch.js"
   },
   "keywords": [],
@@ -12,9 +21,37 @@
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
+    "@fontsource/ibm-plex-mono": "^5.3.0",
+    "@fontsource/ibm-plex-sans": "^5.3.0",
+    "@tanstack/react-query": "^5.101.4",
+    "@tanstack/react-table": "^9.1.2",
+    "express": "^5.2.1",
     "googleapis": "^176.0.0",
+    "lucide-react": "^1.33.0",
     "playwright": "^1.62.1",
     "playwright-extra": "^4.3.6",
-    "playwright-extra-plugin-stealth": "^0.0.1"
+    "playwright-extra-plugin-stealth": "^0.0.1",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
+    "react-router-dom": "^7.18.2",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@testing-library/jest-dom": "^7.0.1",
+    "@testing-library/react": "^16.3.2",
+    "@testing-library/user-event": "^14.6.6",
+    "@types/express": "^5.0.6",
+    "@types/node": "^26.2.0",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.4",
+    "@types/supertest": "^7.2.1",
+    "@vitejs/plugin-react": "^6.1.0",
+    "concurrently": "^10.0.5",
+    "jsdom": "^29.1.1",
+    "supertest": "^7.2.2",
+    "tsx": "^4.23.12",
+    "typescript": "^7.0.2",
+    "vite": "^8.2.2",
+    "vitest": "^4.1.11"
   }
 }

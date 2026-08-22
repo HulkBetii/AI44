@@ -6,6 +6,7 @@ const {
 } = require('./sheets');
 const { getNewProxyWithRetry, parseProxyString } = require('./proxy');
 const gpm = require('./gpm-api');
+const { withAutomationLock } = require('./automation-lock');
 
 const FAILURE_SCREENSHOT = path.join(__dirname, 'debug-failure.png');
 const SUCCESS_CSV = path.join(__dirname, 'success_accounts.csv');
@@ -72,10 +73,31 @@ let currentStep = 'init';
 // Module scope, not loop scope: a GPM profile outlives the process - it is a started browser
 // plus a folder on disk - so every exit path has to be able to see it and release it.
 let gpmProfileId = null;
+let activeRowIndex = null;
+let runReporter = null;
+
+function emitRunEvent(type, message, data = {}, level = 'info') {
+  if (!runReporter || typeof runReporter.emit !== 'function') return;
+  try {
+    runReporter.emit({ type, message, data, level, rowIndex: activeRowIndex });
+  } catch (error) {
+    console.warn(`[reporter] ${error.message}`);
+  }
+}
 
 function step(name) {
   currentStep = name;
   console.log(`[step] ${name}`);
+  emitRunEvent('step.changed', name, { step: name });
+}
+
+function safePageLocation(page) {
+  try {
+    const url = new URL(page.url());
+    return `${url.origin}${url.pathname}`;
+  } catch {
+    return '[unknown page]';
+  }
 }
 
 // The single place the browser connection and the GPM profile are released. Both the
@@ -90,6 +112,9 @@ let releasing = null;
 function releaseProfile() {
   if (releasing) return releasing;
   releasing = (async () => {
+    if (typeof emitRunEvent === 'function') {
+      emitRunEvent('cleanup.started', 'Đang đóng browser và GPM profile');
+    }
     activePage = null;
     if (browser) {
       // Just disconnect the CDP session
@@ -97,8 +122,12 @@ function releaseProfile() {
       browser = null;
     }
     const id = gpmProfileId;
-    if (!id) return;
-    gpmProfileId = null;
+    if (!id) {
+      if (typeof emitRunEvent === 'function') {
+        emitRunEvent('cleanup.completed', 'Không có GPM profile cần giải phóng');
+      }
+      return;
+    }
 
     step('stop and delete GPM profile');
     await gpm.stopProfile(id)
@@ -106,9 +135,15 @@ function releaseProfile() {
     await new Promise((r) => setTimeout(r, 2000));
     // Report what actually happened: mode=2 removes the profile folder, so a run that
     // keeps failing here silently accumulates one directory per account.
-    await gpm.deleteProfile(id)
-      .then(() => console.log(`[GPM] Profile ${id} deleted.`))
-      .catch((e) => console.warn(`[GPM] DELETE FAILED for ${id}: ${e.message} - profile folder left on disk`));
+    await gpm.deleteProfile(id).catch((error) => {
+      console.warn(`[GPM] DELETE FAILED for ${id}: ${error.message} - profile folder left on disk`);
+      throw new Error(`GPM profile cleanup failed for ${id}`);
+    });
+    gpmProfileId = null;
+    console.log(`[GPM] Profile ${id} deleted.`);
+    if (typeof emitRunEvent === 'function') {
+      emitRunEvent('cleanup.completed', 'Đã giải phóng GPM profile');
+    }
   })();
   // Cleared once settled so the next account gets its own release, not this one's result.
   return releasing.finally(() => { releasing = null; });
@@ -233,7 +268,7 @@ async function loginMicrosoft(ctx, hotmailEmail, hotmailPassword) {
   await loginPage.goto('https://outlook.live.com/mail/', { waitUntil: 'domcontentloaded' });
   await loginPage.waitForTimeout(5000);
   await dismissConsentDialog(loginPage);
-  console.log(`[MS] Inbox loaded: ${loginPage.url()}`);
+  console.log(`[MS] Inbox loaded: ${safePageLocation(loginPage)}`);
 
   return loginPage;
 }
@@ -250,7 +285,7 @@ async function loginMicrosoft(ctx, hotmailEmail, hotmailPassword) {
 //
 // Deliberately narrow. "Already have an account? Log in" is standing text on this very page,
 // so anything looser than this would abort every signup instead of the rejected ones.
-const SIGNUP_REJECTED = /already (?:in use|registered|exists|taken)|has already been (?:registered|taken|used)|account (?:already )?exists/i;
+const SIGNUP_REJECTED = /(?:(?:(?:this|that)\s+)?(?:email|address)\s+(?:is\s+already\s+(?:in use|registered|taken)|has\s+already\s+been\s+(?:registered|taken|used))|an?\s+account\s+with\s+(?:this|that)\s+(?:email|address)\s+already\s+exists)/i;
 
 async function waitForManualSignup(page) {
   const BELL = String.fromCharCode(7);
@@ -260,6 +295,9 @@ async function waitForManualSignup(page) {
   process.stdout.write(BELL);
   await page.bringToFront().catch(() => {});
   console.log(`⚠️  Solve the CAPTCHA in the browser window if shown (up to ${Math.round(SIGNUP_TIMEOUT_MS / 60000)} min).`);
+  if (typeof emitRunEvent === 'function') {
+    emitRunEvent('attention.required', 'Cần xử lý CAPTCHA trong cửa sổ GPM', { kind: 'captcha' }, 'warning');
+  }
 
   const started = Date.now();
   let ticks = 0;
@@ -300,11 +338,14 @@ async function waitForManualSignup(page) {
       throw refused;
     }
     if (!settled) {
-      throw new Error(`Signup timed out after ${totalSec}s (still at ${page.url()})`);
+      throw new Error(`Signup timed out after ${totalSec}s`);
     }
     return settled;
   } finally {
     clearInterval(ticker);
+    if (typeof emitRunEvent === 'function') {
+      emitRunEvent('attention.cleared', 'CAPTCHA đã được xử lý hoặc bước đăng ký đã kết thúc');
+    }
   }
 }
 
@@ -387,7 +428,7 @@ async function processAccount(ctx, cred) {
   console.log(`\n${'═'.repeat(60)}`);
   console.log(`▶ ${hotmailEmail}`);
   console.log(`${'═'.repeat(60)}`);
-  console.log(`  ElevenLabs password: ${elevenPassword}`);
+  console.log('  ElevenLabs password: [generated and stored securely]');
 
   // 1. Login Microsoft → get Outlook inbox page
   const outookPage = await loginMicrosoft(ctx, hotmailEmail, hotmailPassword);
@@ -433,7 +474,7 @@ async function processAccount(ctx, cred) {
   step('poll Outlook inbox for verify email');
   activePage = outookPage;
   const verifyUrl = await pollOutlookInbox(outookPage, INBOX_TIMEOUT_MS);
-  console.log('[4] Verify URL found:', verifyUrl.substring(0, 80) + '...');
+  console.log('[4] Verify URL found securely.');
 
   // 5. Open verify URL
   step('open verify URL');
@@ -529,7 +570,7 @@ async function attemptSignIn(page, email, elevenPassword) {
     // No form, and the URL has left the sign-in route: an existing session was reused and
     // the app went straight through. Nothing to submit.
     if (!page.url().includes('/sign-in')) return SIGN_IN.OK;
-    throw new Error(`Sign-in form never appeared at ${page.url()}`);
+    throw new Error('Sign-in form never appeared');
   }
 
   // Let hydration finish before typing - the signup step already does this.
@@ -554,7 +595,7 @@ async function attemptSignIn(page, email, elevenPassword) {
   if (!outcome) {
     const shown = await page.locator('[data-testid="sign-in-email-input"]')
       .inputValue().catch(() => '<no field>');
-    throw new Error(`Sign-in gave no recognised outcome; still at ${page.url()} (email field: "${shown}")`);
+    throw new Error(`Sign-in gave no recognised outcome (email field: "${shown}")`);
   }
   return outcome;
 }
@@ -562,7 +603,7 @@ async function attemptSignIn(page, email, elevenPassword) {
 async function signInAndCreateKey(page, cred, elevenPassword) {
   const outcome = await attemptSignIn(page, cred.email, elevenPassword);
   if (outcome !== SIGN_IN.OK) {
-    throw new Error(`Sign-in did not complete (${outcome}) at ${page.url()}`);
+    throw new Error(`Sign-in did not complete (${outcome})`);
   }
   await page.waitForTimeout(3000);
 
@@ -591,7 +632,7 @@ async function finishOnboardingAndKey(page, cred, elevenPassword) {
   while (page.url().includes('/app/onboarding')) {
     if (Date.now() > onboardingDeadline) {
       throw new Error(
-        `Onboarding did not finish within ${ONBOARDING_TIMEOUT_MS}ms at ${page.url()}.
+        `Onboarding did not finish within ${ONBOARDING_TIMEOUT_MS}ms.
 Last seen: ${lastSeen}`);
     }
 
@@ -748,19 +789,19 @@ Last seen: ${lastSeen}`);
     apiKey = await page.evaluate(() => navigator.clipboard.readText()).catch(() => '');
   }
   if (!apiKey.startsWith('sk_')) {
-    throw new Error(`API key not captured (got: ${JSON.stringify(apiKey)})`);
+    throw new Error('API key was not captured in the expected format');
   }
 
-  console.log(`[9] API Key: ${apiKey}`);
+  console.log('[9] API Key captured and stored securely.');
 
-  // Write results back to Google Sheet. If this throws, the caller marks the row failed
-  // but leaves F/G alone - and the key is on stdout above, so it is not lost silently.
-  await updateResult(cred.rowIndex, apiKey, elevenPassword, 'complete');
-  
+  // Keep the captured values on the run record before the sheet write. If Google rejects the
+  // update, the outer export still persists them locally without leaking them to stdout/logs.
   cred.apiKey = apiKey;
   cred.elevenPassword = elevenPassword;
 
-  console.log(`\n✅ Done: ${cred.email} | ${elevenPassword} | ${apiKey}`);
+  await updateResult(cred.rowIndex, apiKey, elevenPassword, 'complete');
+
+  console.log(`\n✅ Done: ${cred.email}`);
   return apiKey;
 }
 
@@ -780,7 +821,7 @@ async function firstPresent(page, selectors, what) {
       placeholder: el.getAttribute('placeholder'),
       text: (el.textContent || '').trim().slice(0, 40),
     })));
-  console.error(`[reset] ${what} not found at ${page.url()}. Controls on the page:`);
+  console.error(`[reset] ${what} not found. Controls on the page:`);
   for (const c of controls) console.error('   ', JSON.stringify(c));
   throw new Error(`${what} not found`);
 }
@@ -796,7 +837,7 @@ async function resetPasswordAndCreateKey(ctx, cred) {
 ${'═'.repeat(60)}`);
   console.log(`▶ RESET ${email} (sheet row ${rowIndex})`);
   console.log(`${'═'.repeat(60)}`);
-  console.log(`  New ElevenLabs password: ${newPassword}`);
+  console.log('  New ElevenLabs password: [generated and stored securely]');
 
   step('reset — request reset email');
   let page = await ctx.newPage();
@@ -817,7 +858,7 @@ ${'═'.repeat(60)}`);
   await page.getByText('Check your Inbox', { exact: false })
     .waitFor({ timeout: 20000 })
     .catch(() => {
-      throw new Error(`Reset request not confirmed; still at ${page.url()}`);
+      throw new Error(`Reset request not confirmed; still at ${safePageLocation(page)}`);
     });
   console.log('[reset] Reset email requested.');
 
@@ -827,7 +868,7 @@ ${'═'.repeat(60)}`);
 
   step('reset — poll Outlook for reset link');
   const resetUrl = await pollOutlookInbox(outlookPage, INBOX_TIMEOUT_MS, 'resetPassword');
-  console.log('[reset] Reset URL found:', resetUrl.substring(0, 80) + '...');
+  console.log('[reset] Reset URL found securely.');
 
   step('reset — set new password');
   page = await ctx.newPage();
@@ -881,7 +922,7 @@ ${'═'.repeat(60)}`);
   const changed = await page.waitForURL((url) => !url.toString().includes('/app/action'), { timeout: 20000 })
     .then(() => true).catch(() => false);
   if (!changed) {
-    throw new Error(`Password change not confirmed; still at ${page.url()} (new password: ${newPassword})`);
+    throw new Error('Password change was not confirmed by navigation');
   }
 
   // Persist only once the change is confirmed, so column G never holds a password that was
@@ -960,7 +1001,7 @@ ${'═'.repeat(60)}`);
     // does not do - flag it distinctly instead of leaving a misleading 'failed:<step>'.
     console.error(`[resume] Credentials rejected for ${email}; a password reset is required.`);
     await updateStatus(rowIndex, 'credentials-rejected');
-    return;
+    return false;
   }
 
   if (outcome === SIGN_IN.UNVERIFIED) {
@@ -972,7 +1013,7 @@ ${'═'.repeat(60)}`);
 
     step('resume — poll Outlook for verify email');
     const verifyUrl = await pollOutlookInbox(outlookPage, INBOX_TIMEOUT_MS);
-    console.log('[resume] Verify URL found:', verifyUrl.substring(0, 80) + '...');
+    console.log('[resume] Verify URL found securely.');
 
     step('resume — open verify URL');
     page = await ctx.newPage();
@@ -1044,8 +1085,9 @@ function parseArgs(argv) {
   return { limit, row, rows, resume, resetPassword, regenerateKey, noProxy, proxyToken, interval };
 }
 
-async function run() {
-  const { limit, row, rows, resume, resetPassword, regenerateKey, noProxy, proxyToken, interval } = parseArgs(process.argv.slice(2));
+async function run(argv = process.argv.slice(2), reporter = null) {
+  runReporter = reporter;
+  const { limit, row, rows, resume, resetPassword, regenerateKey, noProxy, proxyToken, interval } = parseArgs(argv);
 
   await initSheets();
 
@@ -1120,7 +1162,13 @@ async function run() {
   // The browser will be launched per-account via GPM-Login API.
   for (let i = 0; i < pendingRows.length; i++) {
     const cred = pendingRows[i];
+    activeRowIndex = cred.rowIndex;
     console.log(`\n[${i + 1}/${pendingRows.length}] ${cred.email} (sheet row ${cred.rowIndex})`);
+    emitRunEvent('account.started', `Bắt đầu ${cred.email}`, {
+      email: cred.email,
+      accountNumber: i + 1,
+      totalAccounts: pendingRows.length,
+    });
 
     // Reset before the try: otherwise a throw raised before this account's first step() call
     // would be attributed to the previous account's last step.
@@ -1144,11 +1192,17 @@ async function run() {
       try {
         const proxyData = await getNewProxyWithRetry(activeToken);
         proxyString = proxyData.proxy; // Dạng IP:Port:User:Pass
-        console.log(`[proxy] Got proxy: ${proxyString}`);
+        console.log('[proxy] Proxy acquired securely.');
       } catch (err) {
         console.error(`\n❌ FAILED [${cred.email}] at step: proxy rotation`);
         console.error(err.stack || err.message);
         await updateStatus(cred.rowIndex, 'failed:proxy_api').catch(() => {});
+        emitRunEvent('account.failed', 'Không thể rotate proxy', {
+          email: cred.email,
+          step: 'proxy rotation',
+          status: 'failed:proxy_api',
+          error: err.message,
+        }, 'error');
         continue;
       }
     }
@@ -1173,10 +1227,20 @@ async function run() {
       ctx = contexts.length > 0 ? contexts[0] : await browser.newContext();
 
       // Every path writes its own success row via updateResult.
-      if (regenerateKey) await regenerateAccountKey(ctx, cred);
-      else if (resetPassword) await resetPasswordAndCreateKey(ctx, cred);
-      else if (resume) await resumeAccount(ctx, cred);
-      else await processAccount(ctx, cred);
+      let workflowResult;
+      if (regenerateKey) workflowResult = await regenerateAccountKey(ctx, cred);
+      else if (resetPassword) workflowResult = await resetPasswordAndCreateKey(ctx, cred);
+      else if (resume) workflowResult = await resumeAccount(ctx, cred);
+      else workflowResult = await processAccount(ctx, cred);
+      if (workflowResult === false) {
+        emitRunEvent('account.failed', 'Credential ElevenLabs bị từ chối; cần reset mật khẩu', {
+          email: cred.email,
+          step: currentStep,
+          status: 'credentials-rejected',
+        }, 'error');
+      } else {
+        emitRunEvent('account.succeeded', `Hoàn thành ${cred.email}`, { email: cred.email });
+      }
     } catch (err) {
       console.error(`\n❌ FAILED [${cred.email}] at step: ${currentStep}`);
       console.error(err.stack || err.message);
@@ -1203,19 +1267,26 @@ async function run() {
       // with its password recorded, and losing it would orphan the account for good.
       await updateStatus(cred.rowIndex, failStatus)
         .catch((e) => console.error(`[sheet] status write failed: ${e.message}`));
+      emitRunEvent('account.failed', `Thất bại tại ${currentStep}`, {
+        email: cred.email,
+        step: currentStep,
+        status: failStatus,
+        error: err.message,
+      }, 'error');
 
       if (!activePage || activePage.isClosed()) {
         console.error(`[debug] No page to capture (activePage ${activePage ? 'was closed' : 'was never set'})`);
       }
       if (activePage && !activePage.isClosed()) {
         try {
-          console.error(`[debug] URL: ${activePage.url()}`);
+          console.error(`[debug] Page: ${safePageLocation(activePage)}`);
           const text = await activePage.evaluate(() => document.body.innerText.slice(0, 600));
           console.error(`[debug] Visible text:\n${text}`);
           // Per-row filename: a shared path meant each failure erased the previous evidence.
           const shot = FAILURE_SCREENSHOT.replace(/\.png$/, `-row${cred.rowIndex}.png`);
           await activePage.screenshot({ path: shot, fullPage: true });
           console.error(`[debug] Screenshot: ${shot}`);
+          emitRunEvent('artifact.created', 'Đã lưu screenshot lỗi', { path: shot, kind: 'screenshot' }, 'warning');
         } catch (e) {
           console.error(`[debug] Capture failed: ${e.message}`);
         }
@@ -1251,15 +1322,32 @@ async function run() {
   }
 
   console.log('\n✅ All accounts processed.');
+  activeRowIndex = null;
+  runReporter = null;
 }
 
-run()
-  .catch(async (err) => {
-    console.error('\n❌ Fatal error:', err.stack || err.message);
-    process.exitCode = 1;
-  })
-  .finally(async () => {
-    // A throw outside the per-account try - proxy setup, sheet init - skips the finally that
-    // normally releases the profile, so the outer path has to release it too.
-    await releaseProfile().catch((err) => console.error(`[cleanup] ${err.message}`));
-  });
+async function cancelActiveRun() {
+  emitRunEvent('job.state', 'Đang hủy lượt chạy', { status: 'cancelling' }, 'warning');
+  await releaseProfile();
+}
+
+async function focusActiveBrowser() {
+  if (!activePage || activePage.isClosed()) return false;
+  await activePage.bringToFront();
+  return true;
+}
+
+if (require.main === module) {
+  withAutomationLock('signup-cli', () => run())
+    .catch(async (err) => {
+      console.error('\n❌ Fatal error:', err.stack || err.message);
+      process.exitCode = 1;
+    })
+    .finally(async () => {
+      // A throw outside the per-account try - proxy setup, sheet init - skips the finally that
+      // normally releases the profile, so the outer path has to release it too.
+      await releaseProfile().catch((err) => console.error(`[cleanup] ${err.message}`));
+    });
+}
+
+module.exports = { run, parseArgs, releaseProfile, cancelActiveRun, focusActiveBrowser };

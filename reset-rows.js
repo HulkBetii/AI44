@@ -14,6 +14,7 @@
 // Without a way to name rows, rescuing the first meant re-queueing the second as well.
 
 const { initSheets, loadRows, resetRows } = require('./sheets');
+const { withAutomationLock } = require('./automation-lock');
 
 function parseArgs(argv) {
   const apply = argv.includes('--apply');
@@ -157,7 +158,7 @@ async function main() {
 }
 
 if (require.main === module) {
-  main().catch((err) => {
+  withAutomationLock('reset-rows-cli', main).catch((err) => {
     console.error('❌ Failed:', err.stack || err.message);
     process.exitCode = 1;
   });

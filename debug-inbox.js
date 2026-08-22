@@ -25,7 +25,7 @@ function generatePassword() {
   const email = await mailPage.$eval('#mail', el => el.value);
   const password = generatePassword();
   console.log(`[1] Email: ${email}`);
-  console.log(`[1] Password: ${password}`);
+  console.log('[1] Password generated securely.');
 
   // Extract the token from the page for API polling later
   // temp-mail stores a token in localStorage or cookie
@@ -37,7 +37,7 @@ function generatePassword() {
     // Try cookie
     return document.cookie;
   });
-  console.log('[1] Auth token/cookie:', token?.substring(0, 100));
+  console.log('[1] Auth token/cookie captured securely.');
 
   // ── STEP 2: Sign up on ElevenLabs ──────────────────────────────────────────
   console.log('[2] Navigating to ElevenLabs sign-up...');
@@ -77,7 +77,7 @@ function generatePassword() {
   // Wait and take screenshot after click
   await signupPage.waitForTimeout(5000);
   await signupPage.screenshot({ path: 'debug-after-signup.png' });
-  console.log('[2] Current URL after signup:', signupPage.url());
+  console.log('[2] Signup response page loaded.');
 
   // Check for error messages on page
   const pageText = await signupPage.evaluate(() => document.body.innerText.substring(0, 500));
@@ -143,7 +143,7 @@ function generatePassword() {
     verifyLink.click(),
   ]);
   await verifyTab.waitForLoadState('domcontentloaded');
-  console.log(`[4] Tab URL: ${verifyTab.url()}`);
+  console.log('[4] Verification tab loaded.');
 
   // ── STEP 5: Click Continue ─────────────────────────────────────────────────
   await verifyTab.waitForSelector('button:has-text("Continue")', { timeout: 15000 });
@@ -159,7 +159,7 @@ function generatePassword() {
   await verifyTab.click('[data-testid="sign-in-submit-button"]');
   await verifyTab.waitForTimeout(5000);
   
-  console.log('✅ Done! Final URL:', verifyTab.url());
+  console.log('✅ Done! Final page loaded.');
   console.log(`   Email: ${email}`);
-  console.log(`   Password: ${password}`);
+  console.log('   Password: [REDACTED]');
 })();

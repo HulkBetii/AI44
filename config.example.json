@@ -1,0 +1,8 @@
+{
+  "sheetId": "YOUR_GOOGLE_SHEET_ID",
+  "sheetName": "hotmail",
+  "serviceAccountPath": "D:\\path\\to\\mail-temp\\service-account.json",
+  "gpmApiBase": "http://127.0.0.1:19995",
+  "defaultIntervalMinutes": 1,
+  "runtimeDirectory": "D:\\path\\to\\mail-temp\\.runtime"
+}

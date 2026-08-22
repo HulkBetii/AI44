@@ -13,11 +13,14 @@ function getNewProxy(token, timeoutMs = 15000) {
           if (json.status === 'SUCCESS' && json.proxy) {
             resolve(json);
           } else {
-            const reason = json.message || json.error || JSON.stringify(json);
-            reject(new Error(`Proxy API failed with status: ${json.status} - Reason: ${reason}`));
+            const reason = json.message || json.error || 'Unknown proxy API error';
+            const safeReason = token.length >= 8
+              ? String(reason).split(token).join('[REDACTED]')
+              : String(reason);
+            reject(new Error(`Proxy API failed with status: ${json.status} - Reason: ${safeReason}`));
           }
         } catch (e) {
-          reject(new Error('Failed to parse proxy API response: ' + data));
+          reject(new Error('Failed to parse proxy API response'));
         }
       });
     }).on('error', (e) => {
@@ -101,7 +104,7 @@ function parseProxyString(proxyString) {
       server: `http://${parts[0]}:${parts[1]}`,
     };
   }
-  throw new Error(`Unknown proxy format: ${proxyString}`);
+  throw new Error('Unknown proxy format');
 }
 
 const net = require('net');

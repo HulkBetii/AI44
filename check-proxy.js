@@ -17,8 +17,10 @@
 
 const { initSheets, loadRows } = require('./sheets');
 const { getNewProxyWithRetry, parseProxyString, fetchViaProxy } = require('./proxy');
+const { withAutomationLock } = require('./automation-lock');
 
 async function resolveToken() {
+  if (process.env.MAIL_TEMP_PROXY_TOKEN_OVERRIDE) return process.env.MAIL_TEMP_PROXY_TOKEN_OVERRIDE;
   const arg = process.argv.find((a) => a.startsWith('--token='));
   if (arg) return arg.slice('--token='.length);
 
@@ -39,7 +41,7 @@ const REQUIRED_HOSTS = [
   ['elevenlabs.io', 'https://elevenlabs.io/app/sign-up'],
 ];
 
-(async () => {
+async function main() {
   const token = await resolveToken();
 
   console.log('[1/4] Checking this machine\'s own IP (no proxy)...');
@@ -99,7 +101,9 @@ const REQUIRED_HOSTS = [
     console.log('      is a separate question only a real signup run answers:');
     console.log('        node signup-hotmail.js --row=<n> --proxy-token=<token>');
   }
-})().catch((err) => {
+}
+
+withAutomationLock('proxy-check-cli', main).catch((err) => {
   console.error('❌ Failed:', err.message);
   process.exitCode = 1;
 });
