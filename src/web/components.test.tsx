@@ -1,12 +1,12 @@
 // @vitest-environment jsdom
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { cleanup, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import type { ReactElement } from 'react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import type { AccountSummary, JobPreview, WorkflowDefinition } from '../shared/contracts';
+import type { AccountSummary, JobPreview, JobRequest, WorkflowDefinition } from '../shared/contracts';
 import { api } from './api';
-import { JobComposer, PresenceMark, StatusPill } from './components';
+import { JobComposer, PresenceMark, SecretValue, StatusPill } from './components';
 
 afterEach(() => {
   cleanup();
@@ -24,24 +24,59 @@ describe('shared UI components', () => {
     expect(screen.getByLabelText('API key: có')).toBeInTheDocument();
   });
 
+  it('does not display a reveal response after the displayed account identity changes', async () => {
+    let resolveReveal!: (response: { value: string }) => void;
+    const revealSecret = vi.spyOn(api, 'revealSecret').mockImplementationOnce(() => new Promise((resolve) => {
+      resolveReveal = resolve;
+    }));
+    const user = userEvent.setup();
+    const view = render(<SecretValue rowIndex={25} expectedEmail="first@example.com" field="apiKey" label="API key" present />);
+
+    await user.click(screen.getByRole('button', { name: 'Hiện API key' }));
+    expect(revealSecret).toHaveBeenCalledWith(25, 'apiKey', 'first@example.com');
+
+    view.rerender(<SecretValue rowIndex={25} expectedEmail="replacement@example.com" field="apiKey" label="API key" present />);
+    await act(async () => resolveReveal({ value: 'secret-for-first-account' }));
+
+    expect(screen.queryByText('secret-for-first-account')).not.toBeInTheDocument();
+    expect(screen.getByText('••••••••••••')).toBeInTheDocument();
+  });
+
+  it('confirms a copied credential without exposing its value in feedback', async () => {
+    const user = userEvent.setup();
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText } });
+    vi.spyOn(api, 'revealSecret').mockResolvedValue({ value: 'revealed-secret' });
+    render(<SecretValue rowIndex={25} expectedEmail="operator@example.com" field="apiKey" label="API key" present />);
+
+    await user.click(screen.getByRole('button', { name: 'Hiện API key' }));
+    await user.click(await screen.findByRole('button', { name: 'Copy API key' }));
+
+    expect(writeText).toHaveBeenCalledWith('revealed-secret');
+    expect(await screen.findByRole('status')).toHaveTextContent('Đã copy');
+    expect(screen.getByRole('button', { name: 'Đã copy API key' })).toBeEnabled();
+  });
+
+  it('reports clipboard failures instead of leaving an unhandled rejection', async () => {
+    const user = userEvent.setup();
+    const writeText = vi.fn().mockRejectedValue(new Error('Clipboard bị chặn'));
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText } });
+    vi.spyOn(api, 'revealSecret').mockResolvedValue({ value: 'revealed-secret' });
+    render(<SecretValue rowIndex={25} expectedEmail="operator@example.com" field="apiKey" label="API key" present />);
+
+    await user.click(screen.getByRole('button', { name: 'Hiện API key' }));
+    await user.click(await screen.findByRole('button', { name: 'Copy API key' }));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('Clipboard bị chặn');
+    expect(screen.getByRole('button', { name: 'Copy API key' })).toBeEnabled();
+  });
+
   it('hides unsupported proxy modes and interval for proxy diagnostics', async () => {
     vi.spyOn(api, 'previewJob').mockResolvedValue(preview());
     renderComposer('proxyCheck');
 
     expect(await screen.findByText('Proxy diagnostic')).toBeInTheDocument();
-    expect(screen.queryByRole('option', { name: 'Không dùng proxy' })).not.toBeInTheDocument();
     expect(screen.queryByLabelText('Interval trung bình (phút)')).not.toBeInTheDocument();
-  });
-
-  it('keeps enqueue disabled for an empty proxy override', async () => {
-    vi.spyOn(api, 'previewJob').mockResolvedValue(preview());
-    const user = userEvent.setup();
-    renderComposer('proxyCheck');
-
-    await user.selectOptions(await screen.findByLabelText('Chế độ proxy'), 'override');
-
-    expect(screen.getByLabelText('Proxy token override')).toHaveValue('');
-    expect(screen.getByRole('button', { name: 'Thêm vào hàng đợi' })).toBeDisabled();
   });
 
   it('keeps enqueue disabled when preview fails', async () => {
@@ -92,27 +127,6 @@ describe('shared UI components', () => {
     expect(screen.getByRole('button', { name: 'Thêm vào hàng đợi' })).toBeDisabled();
   });
 
-  it('never stores the real proxy token in React Query caches', async () => {
-    const secret = 'proxy-secret-value';
-    vi.spyOn(api, 'previewJob').mockResolvedValue(preview());
-    const create = vi.spyOn(api, 'createJob').mockResolvedValue({} as never);
-    const user = userEvent.setup();
-    const { queryClient } = renderComposer('proxyCheck');
-
-    await user.selectOptions(await screen.findByLabelText('Chế độ proxy'), 'override');
-    await user.type(screen.getByLabelText('Proxy token override'), secret);
-    await waitFor(() => expect(screen.getByRole('button', { name: 'Thêm vào hàng đợi' })).toBeEnabled());
-
-    const queryCache = JSON.stringify(queryClient.getQueryCache().getAll().map((query) => query.queryKey));
-    expect(queryCache).not.toContain(secret);
-    expect(queryClient.getMutationCache().getAll()).toHaveLength(0);
-
-    await user.click(screen.getByRole('button', { name: 'Thêm vào hàng đợi' }));
-    await waitFor(() => expect(create).toHaveBeenCalled());
-    expect(create.mock.calls[0][0].options.proxyTokenOverride).toBe(secret);
-    expect(queryClient.getMutationCache().getAll()).toHaveLength(0);
-  });
-
   it('labels dynamic full-cycle phases without pretending their counts are fixed', async () => {
     vi.spyOn(api, 'previewJob').mockResolvedValue(preview({
       accepted: [account()],
@@ -153,12 +167,50 @@ describe('shared UI components', () => {
       expect(screen.getByText(`#${item.rowIndex} ${item.email} — ${item.reason}`)).toBeInTheDocument();
     });
   });
+
+  it('lets the operator close a hanging create request and aborts the browser wait', async () => {
+    vi.spyOn(api, 'previewJob').mockResolvedValue(preview({ accepted: [account()] }));
+    let requestSignal: AbortSignal | undefined;
+    vi.spyOn(api, 'createJob').mockImplementation((_request, signal) => new Promise((_resolve, reject) => {
+      requestSignal = signal;
+      signal?.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), { once: true });
+    }));
+    const onClose = vi.fn();
+    const user = userEvent.setup();
+    renderComposer('signup', { onClose });
+
+    await user.click(await screen.findByRole('button', { name: /Thêm vào hàng đợi/ }));
+    const stopButton = (await screen.findAllByRole('button', { name: 'Dừng chờ và đóng' }))
+      .find((button) => button.classList.contains('button-ghost'))!;
+    expect(stopButton).toBeEnabled();
+    expect(screen.getByText(/không hủy request trên server/i)).toBeInTheDocument();
+
+    await user.click(stopButton);
+    expect(requestSignal?.aborted).toBe(true);
+    expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps identity selections for both retry preview and create', async () => {
+    const selection: JobRequest['selection'] = {
+      mode: 'identities',
+      accounts: [{ rowIndex: 25, email: 'operator@example.com' }],
+    };
+    const previewJob = vi.spyOn(api, 'previewJob').mockResolvedValue(preview({ accepted: [account(49)] }));
+    const createJob = vi.spyOn(api, 'createJob').mockResolvedValue({} as never);
+    const user = userEvent.setup();
+    renderComposer('signup', { selection });
+
+    await user.click(await screen.findByRole('button', { name: /Thêm vào hàng đợi/ }));
+
+    expect(previewJob).toHaveBeenCalledWith(expect.objectContaining({ selection }));
+    expect(createJob).toHaveBeenCalledWith(expect.objectContaining({ selection }), expect.any(AbortSignal));
+  });
 });
 
 const workflows: WorkflowDefinition[] = [
-  { id: 'signup', label: 'Chạy pending', description: 'Signup', risk: 'normal', supportsAccountSelection: true, allowedProxyModes: ['sheet', 'none', 'override'], usesInterval: true },
-  { id: 'fullCycle', label: 'Chạy full cycle', description: 'Full cycle', risk: 'attention', supportsAccountSelection: true, allowedProxyModes: ['sheet', 'none', 'override'], usesInterval: true },
-  { id: 'proxyCheck', label: 'Kiểm tra proxy', description: 'Proxy diagnostic', risk: 'normal', supportsAccountSelection: false, allowedProxyModes: ['sheet', 'override'], usesInterval: false },
+  { id: 'signup', label: 'Chạy pending', description: 'Signup', risk: 'normal', supportsAccountSelection: true, usesInterval: true },
+  { id: 'fullCycle', label: 'Chạy full cycle', description: 'Full cycle', risk: 'attention', supportsAccountSelection: true, usesInterval: true },
+  { id: 'proxyCheck', label: 'Kiểm tra proxy', description: 'Proxy diagnostic', risk: 'normal', supportsAccountSelection: false, usesInterval: false },
 ];
 
 interface ComposerOptions {
@@ -167,6 +219,10 @@ interface ComposerOptions {
   workflowError?: unknown;
   settingsError?: unknown;
   settingsLoading?: boolean;
+  creationDisabledReason?: string;
+  onClose?: () => void;
+  onCreated?: () => void;
+  selection?: JobRequest['selection'];
 }
 
 function composerElement(
@@ -177,14 +233,15 @@ function composerElement(
   return (
     <QueryClientProvider client={queryClient}>
       <JobComposer
-        state={{ workflowId }}
+        state={{ workflowId, selection: options.selection }}
         workflows={options.workflows ?? workflows}
         workflowError={options.workflowError}
         settingsError={options.settingsError}
         settingsLoading={options.settingsLoading ?? false}
         defaultInterval={options.defaultInterval ?? 1}
-        onClose={vi.fn()}
-        onCreated={vi.fn()}
+        creationDisabledReason={options.creationDisabledReason}
+        onClose={options.onClose ?? vi.fn()}
+        onCreated={options.onCreated ?? vi.fn()}
       />
     </QueryClientProvider>
   );
@@ -207,7 +264,6 @@ function account(rowIndex = 2, email = 'operator@example.com'): AccountSummary {
     eligibleWorkflows: ['signup', 'fullCycle'],
     hasElevenPassword: false,
     hasApiKey: false,
-    hasProxyToken: true,
     lastRunAt: null,
     runtime: null,
   };

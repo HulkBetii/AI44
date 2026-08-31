@@ -9,6 +9,9 @@ const src = fs.readFileSync(path.join(__dirname, '..', 'signup-hotmail.js'), 'ut
 const pick = (re) => src.match(re)[0];
 const bundle = [
   pick(/const SIGN_IN = \{[^}]*\};/),
+  pick(/const SIGN_IN_EMAIL_SELECTOR = [^;]*;/),
+  pick(/const SIGN_IN_PASSWORD_SELECTOR = [^;]*;/),
+  pick(/const SIGN_IN_SUBMIT_SELECTOR = [^;]*;/),
   pick(/function firstOutcome\(candidates, timeoutMs\) \{[\s\S]*?\n\}/),
   pick(/async function attemptSignIn\(page, email, elevenPassword\) \{[\s\S]*?\n\}/),
   'return { attemptSignIn, SIGN_IN };',
@@ -26,6 +29,7 @@ const url = (mode) =>
     ['unverified', SIGN_IN.UNVERIFIED],
     ['rejected', SIGN_IN.REJECTED],
   ]) {
+    console.log(`Starting test for mode: ${mode}`);
     const page = await browser.newPage();
     await page.goto(url(mode));
     const got = await attemptSignIn(page, 'test@example.com', 'Passw0rd!');

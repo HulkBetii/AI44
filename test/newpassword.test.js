@@ -1,29 +1,33 @@
 const assert = require('assert');
-const fs = require('fs');
 const path = require('path');
 const { pathToFileURL } = require('url');
 const { chromium } = require('playwright');
 
-const src = fs.readFileSync(path.join(__dirname, '..', 'signup-hotmail.js'), 'utf8');
-const { generateRealisticName } = require('../human-behavior.js');
-// generatePassword still lives in signup-hotmail.js but now depends on a module import,
-// so inject it rather than hoisting the whole module.
-const generatePassword = new Function('generateRealisticName',
-  `return ${src.match(/function generatePassword\(\) \{[\s\S]*?\n\}/)[0]}`)(generateRealisticName);
+const { generateSecurePassword: generatePassword } = require('../password-generator');
 
 const url = pathToFileURL(path.join(__dirname, 'fixtures', 'reset', 'new-password.html')).href;
 
 // The form states: minimum 8, at least one number, at least one special character.
-const meetsRules = (v) => v.length >= 8 && /[0-9]/.test(v) && /[^A-Za-z0-9]/.test(v);
+const meetsRules = (value) => value.length === 20
+  && /[A-Z]/.test(value)
+  && /[a-z]/.test(value)
+  && /[0-9]/.test(value)
+  && /[^A-Za-z0-9]/.test(value);
 
 (async () => {
   // Generator must satisfy the displayed rules on every draw, not just usually.
   for (let i = 0; i < 500; i++) {
     const pw = generatePassword();
-    assert.ok(meetsRules(pw), `generated password fails the form rules: ${pw}`);
+    assert.ok(meetsRules(pw), 'generated password fails the form rules');
+    assert.strictEqual(pw.length, 20);
   }
   const sample = generatePassword();
   console.log(`✓ 500/500 generated passwords meet the stated rules (len=${sample.length})`);
+
+  const unique = new Set();
+  for (let i = 0; i < 5000; i++) unique.add(generatePassword());
+  assert.strictEqual(unique.size, 5000);
+  console.log('✓ 5000 cryptographic samples are unique');
 
   const browser = await chromium.launch();
   const page = await browser.newPage();

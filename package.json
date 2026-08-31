@@ -11,7 +11,9 @@
     "build:server": "tsc -p tsconfig.server.json",
     "build:web": "vite build --config vite.config.mts",
     "start": "node dist/server/index.js",
-    "test": "node test/run-all.js && vitest run",
+    "test": "npm run test:syntax && npm run test:typecheck && node test/run-all.js && vitest run",
+    "test:syntax": "node test/check-root-syntax.js",
+    "test:typecheck": "tsc -p tsconfig.server-tests.json && tsc -p tsconfig.web.json",
     "test:legacy": "node test/run-all.js",
     "test:new": "vitest run",
     "batch": "node batch.js"

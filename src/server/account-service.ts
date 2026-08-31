@@ -7,7 +7,20 @@ interface SheetsModule {
   configureSheets(config: { sheetId: string; sheetName: string; serviceAccountPath: string }): void;
   initSheets(): Promise<void>;
   loadRows(): Promise<AccountRow[]>;
+  updatePassword(rowIndex: number, password: string): Promise<void>;
+  updatePasswordByEmail(email: string, password: string): Promise<AccountRow>;
   resetRows(rowIndexes: number[]): Promise<void>;
+}
+
+export class AccountIdentityConflictError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'AccountIdentityConflictError';
+  }
+}
+
+function normalizeEmail(email: string): string {
+  return email.trim().toLowerCase();
 }
 
 export class AccountService {
@@ -52,8 +65,9 @@ export class AccountService {
     rowIndex: number,
     recentJobs: AccountDetail['recentJobs'] = [],
     runtime: AccountRuntime | null = null,
+    currentAccounts?: AccountRow[],
   ): Promise<AccountDetail | null> {
-    const account = (await this.rows()).find((row) => row.rowIndex === rowIndex);
+    const account = (currentAccounts || await this.rows()).find((row) => row.rowIndex === rowIndex);
     if (!account) return null;
     return {
       ...toAccountSummary(account, recentJobs[0]?.createdAt || null, runtime),
@@ -65,14 +79,22 @@ export class AccountService {
     };
   }
 
-  async reveal(rowIndex: number, field: 'hotmailPassword' | 'elevenPassword' | 'apiKey' | 'proxyToken'): Promise<string | null> {
-    const account = (await this.rows(true)).find((row) => row.rowIndex === rowIndex);
-    if (!account) return null;
+  async reveal(
+    rowIndex: number,
+    field: 'hotmailPassword' | 'elevenPassword' | 'apiKey',
+    expectedEmail: string,
+  ): Promise<string> {
+    const normalizedExpectedEmail = normalizeEmail(expectedEmail);
+    const matches = (await this.rows(true))
+      .filter((row) => normalizeEmail(row.email) === normalizedExpectedEmail);
+    if (matches.length !== 1 || matches[0].rowIndex !== rowIndex) {
+      throw new AccountIdentityConflictError('Account identity changed; refresh the account before revealing credentials');
+    }
+    const account = matches[0];
     const values = {
       hotmailPassword: account.password,
       elevenPassword: account.elevenPass,
       apiKey: account.apiKey,
-      proxyToken: account.proxyToken,
     };
     return values[field] || '';
   }
@@ -81,6 +103,19 @@ export class AccountService {
     await this.connect();
     await this.sheets.resetRows(rowIndexes);
     this.cache = null;
+  }
+
+  async updatePassword(rowIndex: number, password: string): Promise<void> {
+    await this.connect();
+    await this.sheets.updatePassword(rowIndex, password);
+    this.invalidateRows([rowIndex]);
+  }
+
+  async updatePasswordByEmail(email: string, password: string): Promise<AccountRow> {
+    await this.connect();
+    const row = await this.sheets.updatePasswordByEmail(email, password);
+    this.invalidateRows([row.rowIndex]);
+    return row;
   }
 
   invalidate(): void {

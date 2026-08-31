@@ -13,6 +13,8 @@ const KEYS_TXT = path.join(os.tmpdir(), `keys-test-${process.pid}.txt`);
 const build = () => new Function('fs', 'SUCCESS_CSV', 'KEYS_TXT', 'Q', `
   ${src.match(/function csvCell\(value\) \{[\s\S]*?\n\}/)[0]}
   ${src.match(/function appendLine\(file, text\) \{[\s\S]*?\n\}/)[0]}
+  ${src.match(/function parseCsvRows\(text\) \{[\s\S]*?\n\}/)[0]}
+  ${src.match(/function fileHasLine\(file, expected\) \{[\s\S]*?\n\}/)[0]}
   ${src.match(/function appendSuccessCSV\([\s\S]*?\n\}/)[0]}
   return appendSuccessCSV;
 `)(fs, SUCCESS_CSV, KEYS_TXT, String.fromCharCode(34));
@@ -75,15 +77,31 @@ console.log('✓ missing fields become empty cells, not "undefined"');
 // The guard that decides whether a row is written at all. loadRows fills apiKey from column F,
 // so without the per-run reset a failed --regenerate-key wrote a success row carrying the
 // stale key and an undefined password.
-const guardSrc = src.match(/cred\.apiKey = null;\s*\n\s*cred\.elevenPassword = null;/);
-assert.ok(guardSrc, 'per-run reset of cred.apiKey/elevenPassword is missing from the loop');
-console.log('✓ the run loop clears cred.apiKey before each account');
+const guardSrc = src.match(/const existingApiKey = cred\.apiKey;[\s\S]*?cred\.apiKey = resetPassword \? existingApiKey : null;\s*\n\s*cred\.elevenPassword = null;/);
+assert.ok(guardSrc, 'per-run key reset/preservation guard is missing from the loop');
+console.log('✓ the run loop clears stale keys except when reset must preserve an existing key');
 
 // keys.txt is a second sink for the same secret, so it gets the same treatment: one key
 // per line, in order.
 const keyLines = fs.readFileSync(KEYS_TXT, 'utf8').trim().split('\n');
 assert.deepStrictEqual(keyLines, ['sk_abc123', 'sk_def456']);
 console.log('✓ keys.txt receives one key per line');
+
+appendSuccessCSV({ email: 'b@example.com', password: 'pw' }, 'ev', 'sk_def456', '');
+assert.strictEqual(parseCsv(fs.readFileSync(SUCCESS_CSV, 'utf8')).length, 3);
+assert.deepStrictEqual(
+  fs.readFileSync(KEYS_TXT, 'utf8').trim().split('\n'),
+  ['sk_abc123', 'sk_def456'],
+);
+console.log('✓ retrying captured-credential persistence does not duplicate CSV or key lines');
+
+const accountFinally = src.match(/\} finally \{\s+let persistenceError = null;[\s\S]*?if \(cleanupError\) throw cleanupError;\s+\}/)[0];
+assert.ok(
+  accountFinally.indexOf('persistCapturedCredentials(cred, proxyString)')
+    < accountFinally.indexOf('await releaseProfile()'),
+  'captured credentials must persist before cleanup can fail',
+);
+console.log('✓ captured credentials persist before a failing profile cleanup can abort the run');
 
 // A keys file whose last line has no newline - hand-written, or produced by another tool -
 // used to get the next key appended onto the end of it, fusing two keys into one unusable

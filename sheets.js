@@ -1,19 +1,22 @@
 const { google } = require('googleapis');
 const fs = require('fs');
 const path = require('path');
+const { loadRuntimeConfig } = require('./runtime-config');
 
-const SHEET_ID = process.env.MAIL_TEMP_SHEET_ID || '1nNAzzC34zSvX2S_AJ4jB6njhKnKRWs8KeZ0mJ5oSkTU';
-const SHEET_NAME = process.env.MAIL_TEMP_SHEET_NAME || 'hotmail';
+const initialConfig = loadRuntimeConfig();
+const SHEET_ID = initialConfig.sheetId;
+const SHEET_NAME = initialConfig.sheetName;
 let activeSheetId = SHEET_ID;
 let activeSheetName = SHEET_NAME;
-let activeServiceAccountPath = process.env.GOOGLE_SERVICE_ACCOUNT_PATH || null;
+let activeServiceAccountPath = initialConfig.serviceAccountPath;
 
 // Columns (0-indexed into a row array): A=email B=password C=msaToken D=tenantGuid
-//                                       E=recoveryEmail F=apiKey G=elevenPass H=status I=proxyToken
+//                                       E=recoveryEmail F=apiKey G=elevenPass H=status
 const COL = {
   email: 0, password: 1, msaToken: 2, tenantGuid: 3, recoveryEmail: 4,
-  apiKey: 5, elevenPass: 6, status: 7, proxyToken: 8,
+  apiKey: 5, elevenPass: 6, status: 7,
 };
+const SHEET_IDENTITY_UNSAFE = 'SHEET_IDENTITY_UNSAFE';
 
 let sheetsClient = null;
 
@@ -66,15 +69,48 @@ async function loadRows() {
     msaToken: r[COL.msaToken] || '',
     tenantGuid: r[COL.tenantGuid] || '',
     recoveryEmail: r[COL.recoveryEmail] || '',
-    apiKey: r[COL.apiKey] || '',
-    elevenPass: r[COL.elevenPass] || '',
+    apiKey: (r[COL.apiKey] || '').trim(),
+    elevenPass: (r[COL.elevenPass] || '').trim(),
     status: (r[COL.status] || '').trim().toLowerCase(),
-    proxyToken: (r[COL.proxyToken] || '').trim(),
   }));
 }
 
 async function loadPendingRows() {
   return (await loadRows()).filter((r) => r.status === 'pending');
+}
+
+function normalizeEmail(value) {
+  return String(value || '').trim().toLowerCase();
+}
+
+function unsafeIdentity(message) {
+  const error = new Error(message);
+  error.code = SHEET_IDENTITY_UNSAFE;
+  return error;
+}
+
+async function resolveUniqueRowsByEmail(emails) {
+  const identities = emails.map((email) => ({ email, normalizedEmail: normalizeEmail(email) }));
+  if (identities.some(({ normalizedEmail }) => !normalizedEmail)) {
+    throw unsafeIdentity('Sheet mutation requires non-empty email identities');
+  }
+  if (new Set(identities.map(({ normalizedEmail }) => normalizedEmail)).size !== identities.length) {
+    throw unsafeIdentity('Sheet mutation received duplicate email identities');
+  }
+  const rows = await loadRows();
+  return identities.map(({ email, normalizedEmail }) => {
+    const matches = rows.filter((row) => normalizeEmail(row.email) === normalizedEmail);
+    if (matches.length !== 1) {
+      throw unsafeIdentity(
+        `Sheet mutation for ${email} requires exactly one matching row; found ${matches.length}`,
+      );
+    }
+    return matches[0];
+  });
+}
+
+async function resolveUniqueRowByEmail(email) {
+  return (await resolveUniqueRowsByEmail([email]))[0];
 }
 
 async function writeRange(range, values) {
@@ -99,10 +135,39 @@ async function updatePassword(rowIndex, elevenPass) {
   console.log(`[sheet] Row ${rowIndex} → password stored`);
 }
 
+async function updatePasswordAndStatus(rowIndex, elevenPass, status) {
+  await writeRange(`G${rowIndex}:H${rowIndex}`, [elevenPass, status]);
+  console.log(`[sheet] Row ${rowIndex} → password stored, status: ${status}`);
+}
+
 // Success path only.
 async function updateResult(rowIndex, apiKey, elevenPass, status) {
   await writeRange(`F${rowIndex}:H${rowIndex}`, [apiKey, elevenPass, status]);
   console.log(`[sheet] Row ${rowIndex} → status: ${status}`);
+}
+
+async function updateStatusByEmail(email, status) {
+  const row = await resolveUniqueRowByEmail(email);
+  await updateStatus(row.rowIndex, status);
+  return row;
+}
+
+async function updatePasswordByEmail(email, elevenPass) {
+  const row = await resolveUniqueRowByEmail(email);
+  await updatePassword(row.rowIndex, elevenPass);
+  return row;
+}
+
+async function updatePasswordAndStatusByEmail(email, elevenPass, status) {
+  const row = await resolveUniqueRowByEmail(email);
+  await updatePasswordAndStatus(row.rowIndex, elevenPass, status);
+  return row;
+}
+
+async function updateResultByEmail(email, apiKey, elevenPass, status) {
+  const row = await resolveUniqueRowByEmail(email);
+  await updateResult(row.rowIndex, apiKey, elevenPass, status);
+  return row;
 }
 
 // Clears F/G and returns status to 'pending' for the given rows, in one batched request.
@@ -120,9 +185,24 @@ async function resetRows(rowIndexes) {
   });
 }
 
+async function appendRows(values) {
+  if (!values || values.length === 0) return;
+  const res = await client().spreadsheets.values.append({
+    spreadsheetId: activeSheetId,
+    range: `${activeSheetName}!A:I`,
+    valueInputOption: 'RAW',
+    insertDataOption: 'INSERT_ROWS',
+    requestBody: { values },
+  });
+  return res.data;
+}
+
 module.exports = {
-  SHEET_ID, SHEET_NAME, COL,
+  SHEET_ID, SHEET_NAME, COL, SHEET_IDENTITY_UNSAFE,
   configureSheets,
   initSheets, loadRows, loadPendingRows,
-  updateStatus, updatePassword, updateResult, resetRows,
+  updateStatus, updatePassword, updatePasswordAndStatus, updateResult, resetRows,
+  resolveUniqueRowByEmail, resolveUniqueRowsByEmail,
+  updateStatusByEmail, updatePasswordByEmail, updatePasswordAndStatusByEmail, updateResultByEmail,
+  appendRows,
 };

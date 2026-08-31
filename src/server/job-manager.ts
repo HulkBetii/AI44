@@ -1,16 +1,32 @@
 import { EventEmitter } from 'node:events';
 import path from 'node:path';
 import { fork, type ChildProcess } from 'node:child_process';
-import type { JobEvent, JobPreviewRequest, JobRecord, JobRequest, JobStatus, PublicJobRequest } from '../shared/contracts';
+import {
+  type JobEvent,
+  type JobPreviewRequest,
+  type JobRecord,
+  type JobRequest,
+  type JobStatus,
+  type PublicJobRequest,
+  type RuntimeSettings,
+} from '../shared/contracts';
 import { previewJob } from './domain';
 import type { AccountService } from './account-service';
-import type { ConfigStore } from './config';
+import { runtimeEnvironment, runtimeSecretValues, type ConfigStore } from './config';
 import type { JobStore } from './job-store';
 import { redactText } from './redactor';
+import type { RecoveryService } from './recovery';
 
 interface WorkerEventMessage {
   kind: 'event';
   event: Omit<JobEvent, 'id' | 'jobId' | 'sequence' | 'timestamp'>;
+}
+
+export class AutomationLockConflictError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'AutomationLockConflictError';
+  }
 }
 
 export function createLineBuffer(onLine: (line: string) => void) {
@@ -28,8 +44,25 @@ export function createLineBuffer(onLine: (line: string) => void) {
   };
 }
 
+export function createWorkerEnvironment(
+  settings: RuntimeSettings,
+  ambientEnvironment: NodeJS.ProcessEnv = process.env,
+): NodeJS.ProcessEnv {
+  const environment = {
+    ...ambientEnvironment,
+    ...runtimeEnvironment(settings),
+  };
+  delete environment.MAIL_TEMP_LOCK_TOKEN;
+  delete environment.MAIL_TEMP_LOCK_HELD;
+  return environment;
+}
+
 export class JobManager extends EventEmitter {
   private queue: string[] = [];
+  private createChain = Promise.resolve();
+  private createOperations = 0;
+  private preparingJobId: string | null = null;
+  private pumping = false;
   private activeJobId: string | null = null;
   private worker: ChildProcess | null = null;
   private privateRequests = new Map<string, JobRequest>();
@@ -37,6 +70,7 @@ export class JobManager extends EventEmitter {
   private forcedTermination = new Set<string>();
   private seenRows = new Map<string, Set<number>>();
   private focusWaiters = new Map<string, Set<(focused: boolean) => void>>();
+  private cancelTimers = new Map<string, NodeJS.Timeout>();
   private shuttingDown = false;
   private cleanupBlocked = false;
 
@@ -45,35 +79,71 @@ export class JobManager extends EventEmitter {
     private readonly accountService: AccountService,
     private readonly configStore: ConfigStore,
     private readonly store: JobStore,
+    private readonly recoveryService?: RecoveryService,
+    private readonly lockReader: (runtimeDirectory: string) => { status: 'free' | 'busy' | 'stale' } = () => ({ status: 'free' }),
+    private readonly automationAdmissionGuard: (runtimeDirectory: string) => void = () => undefined,
+    private readonly recoveryGuardAcquirer: (runtimeDirectory: string) => () => void = () => () => undefined,
   ) {
     super();
   }
 
-  async preview(request: JobPreviewRequest | JobRequest, excludeJobId?: string) {
+  async preview(
+    request: JobPreviewRequest | JobRequest,
+    excludeJobId?: string,
+    eligibilityOptions: { explicitReset?: boolean } = {},
+  ) {
+    const accounts = await this.accountService.rows(true);
     return previewJob(
-      await this.accountService.rows(true),
+      accounts,
       request,
-      this.store.runtimesByRow(excludeJobId),
+      this.store.runtimesByRow(excludeJobId, accounts),
+      eligibilityOptions,
     );
   }
 
   async create(request: JobRequest): Promise<JobRecord> {
-    if (this.cleanupBlocked) {
-      throw new Error('Queue đang khóa vì GPM cleanup thất bại; kiểm tra profile còn sót và restart server trước khi chạy tiếp');
+    this.createOperations++;
+    const previous = this.createChain;
+    let release!: () => void;
+    this.createChain = new Promise<void>((resolve) => { release = resolve; });
+    await previous;
+    try {
+      if (this.shuttingDown) throw new Error('Server đang dừng; không thể tạo job mới');
+      if (this.cleanupBlocked) {
+        throw new Error('Queue đang khóa vì GPM cleanup thất bại; kiểm tra profile còn sót và restart server trước khi chạy tiếp');
+      }
+      const hasOwnedActiveWorker = Boolean(this.activeJobId);
+      if (!hasOwnedActiveWorker) {
+        this.assertAutomationAvailable();
+        await this.prepareRecoveryForJob();
+      }
+      const preview = await this.preview(request);
+      if (this.shuttingDown) throw new Error('Server đang dừng; không thể tạo job mới');
+      if (request.workflowId !== 'proxyCheck' && preview.accepted.length === 0) {
+        throw new Error('Không có account hợp lệ cho workflow đã chọn');
+      }
+      const publicRequest = this.toPublicRequest(request);
+      const acceptedAccounts = preview.accepted.map((account) => ({
+        rowIndex: account.rowIndex,
+        email: account.email.trim(),
+      }));
+      const job = this.store.create(
+        publicRequest,
+        acceptedAccounts.map((account) => account.rowIndex),
+        preview.rejected.length,
+        acceptedAccounts,
+      );
+      this.privateRequests.set(job.id, request);
+      this.queue.push(job.id);
+      const queuedEvent = this.store.readEvents(job.id).at(-1);
+      if (queuedEvent) this.publish(queuedEvent);
+      this.emit('changed', job);
+      void this.pump();
+      return job;
+    } finally {
+      this.createOperations--;
+      release();
     }
-    const preview = await this.preview(request);
-    if (request.workflowId !== 'proxyCheck' && preview.accepted.length === 0) {
-      throw new Error('Không có account hợp lệ cho workflow đã chọn');
-    }
-    const publicRequest = this.toPublicRequest(request);
-    const job = this.store.create(publicRequest, preview.accepted.map((account) => account.rowIndex), preview.rejected.length);
-    this.privateRequests.set(job.id, request);
-    this.queue.push(job.id);
-    const queuedEvent = this.store.readEvents(job.id).at(-1);
-    if (queuedEvent) this.publish(queuedEvent);
-    this.emit('changed', job);
-    void this.pump();
-    return job;
   }
 
   active(): JobRecord | null {
@@ -89,7 +159,17 @@ export class JobManager extends EventEmitter {
   }
 
   canEditSettings(): boolean {
-    return !this.cleanupBlocked && !this.activeJobId && this.queue.length === 0;
+    return this.canMutateRecovery()
+      && (this.recoveryService?.canEditSettings() ?? true);
+  }
+
+  canMutateRecovery(): boolean {
+    return !this.cleanupBlocked
+      && !this.shuttingDown
+      && !this.activeJobId
+      && !this.preparingJobId
+      && this.createOperations === 0
+      && this.queue.length === 0;
   }
 
   async cancel(jobId: string): Promise<JobRecord> {
@@ -103,12 +183,16 @@ export class JobManager extends EventEmitter {
     if (jobId !== this.activeJobId || !this.worker) throw new Error('Lượt chạy này không thể hủy');
     const updated = this.transition(jobId, 'cancelling', 'Đang đóng browser và giải phóng GPM profile');
     this.worker.send?.({ kind: 'cancel' });
-    setTimeout(() => {
+    this.clearCancelTimer(jobId);
+    const timeout = setTimeout(() => {
+      this.cancelTimers.delete(jobId);
       if (this.activeJobId === jobId && this.worker) {
         this.forcedTermination.add(jobId);
         this.worker.kill();
       }
-    }, 45_000).unref();
+    }, 45_000);
+    timeout.unref();
+    this.cancelTimers.set(jobId, timeout);
     return updated;
   }
 
@@ -151,60 +235,120 @@ export class JobManager extends EventEmitter {
   }
 
   private async pump(): Promise<void> {
-    if (this.shuttingDown || this.cleanupBlocked || this.activeJobId || this.queue.length === 0) return;
-    const jobId = this.queue.shift()!;
-    const job = this.store.get(jobId);
-    const request = this.privateRequests.get(jobId);
-    if (!job || !request) {
-      void this.pump();
-      return;
-    }
-
-    let freshPreview;
+    if (this.pumping) return;
+    this.pumping = true;
     try {
-      freshPreview = await this.preview(request, jobId);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : 'Không thể kiểm tra Google Sheet';
-      this.transition(jobId, 'failed', `Không thể kiểm tra eligibility: ${message}`);
-      this.privateRequests.delete(jobId);
-      void this.pump();
-      return;
-    }
-    const acceptedRows = freshPreview.accepted.map((account) => account.rowIndex);
-    if (request.workflowId !== 'proxyCheck' && acceptedRows.length === 0) {
-      this.transition(jobId, 'failed', 'Eligibility đã thay đổi; không còn account hợp lệ');
-      this.privateRequests.delete(jobId);
-      void this.pump();
-      return;
-    }
+      while (!this.shuttingDown && !this.cleanupBlocked && !this.activeJobId && this.queue.length > 0) {
+        const jobId = this.queue[0];
+        this.preparingJobId = jobId;
+        const job = this.store.get(jobId);
+        const request = this.privateRequests.get(jobId);
+        if (!job || !request || job.status !== 'queued') {
+          this.queue.shift();
+          this.privateRequests.delete(jobId);
+          continue;
+        }
 
-    this.activeJobId = jobId;
-    this.seenRows.set(jobId, new Set());
-    this.store.update(jobId, {
-      status: 'running',
-      startedAt: new Date().toISOString(),
-      acceptedRows,
-      totalAccounts: acceptedRows.length,
-      lastMessage: 'Worker đã bắt đầu',
+        let freshPreview;
+        try {
+          this.assertAutomationAvailable();
+          await this.prepareRecoveryForJob();
+          freshPreview = await this.previewQueuedJob(jobId, request);
+        } catch (error) {
+          const current = this.store.get(jobId);
+          if (this.queue[0] === jobId && current?.status === 'queued') {
+            this.queue.shift();
+            const message = error instanceof Error ? error.message : 'Không thể kiểm tra Google Sheet';
+            this.transition(jobId, 'failed', `Không thể kiểm tra eligibility: ${message}`);
+          }
+          this.privateRequests.delete(jobId);
+          continue;
+        }
+
+        const current = this.store.get(jobId);
+        if (
+          this.shuttingDown
+          || this.cleanupBlocked
+          || this.queue[0] !== jobId
+          || current?.status !== 'queued'
+          || this.privateRequests.get(jobId) !== request
+        ) {
+          continue;
+        }
+
+        const acceptedRows = freshPreview.accepted.map((account) => account.rowIndex);
+        const acceptedAccounts = freshPreview.accepted.map((account) => ({
+          rowIndex: account.rowIndex,
+          email: account.email.trim(),
+        }));
+        if (request.workflowId !== 'proxyCheck' && acceptedRows.length === 0) {
+          this.queue.shift();
+          this.transition(jobId, 'failed', 'Eligibility đã thay đổi; không còn account hợp lệ');
+          this.privateRequests.delete(jobId);
+          continue;
+        }
+
+        this.queue.shift();
+        this.preparingJobId = null;
+        this.activeJobId = jobId;
+        this.seenRows.set(jobId, new Set());
+        this.store.update(jobId, {
+          status: 'running',
+          startedAt: new Date().toISOString(),
+          acceptedRows,
+          acceptedAccounts,
+          totalAccounts: acceptedRows.length,
+          lastMessage: 'Worker đã bắt đầu',
+        });
+        this.publish(this.store.appendEvent(jobId, {
+          type: 'job.state', level: 'info', message: 'Worker đã bắt đầu', data: { status: 'running' },
+        }));
+        try {
+          this.startWorker(jobId, request, acceptedRows, acceptedAccounts);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : 'Không thể khởi động worker';
+          this.transition(jobId, 'failed', `Không thể khởi động worker: ${message}`);
+          this.privateRequests.delete(jobId);
+          this.seenRows.delete(jobId);
+          this.activeJobId = null;
+          this.worker = null;
+          continue;
+        }
+        return;
+      }
+    } finally {
+      this.preparingJobId = null;
+      this.pumping = false;
+      if (!this.shuttingDown && !this.cleanupBlocked && !this.activeJobId && this.queue.length > 0) {
+        void this.pump();
+      }
+    }
+  }
+
+  private async previewQueuedJob(jobId: string, request: JobRequest) {
+    if (request.workflowId === 'proxyCheck') return this.preview(request, jobId);
+    const identities = this.store.get(jobId)?.acceptedAccounts || [];
+    return this.preview({
+      ...request,
+      selection: { mode: 'identities', accounts: identities },
+    }, jobId, {
+      explicitReset: request.workflowId === 'resetPassword' && request.selection.mode !== 'allEligible',
     });
-    this.publish(this.store.appendEvent(jobId, {
-      type: 'job.state', level: 'info', message: 'Worker đã bắt đầu', data: { status: 'running' },
-    }));
+  }
 
+  private startWorker(
+    jobId: string,
+    request: JobRequest,
+    acceptedRows: number[],
+    acceptedAccounts: Array<{ rowIndex: number; email: string }>,
+  ): void {
     const settings = this.configStore.get();
     const workerPath = path.join(this.projectRoot, 'automation-worker.js');
-    const secrets = request.options.proxyTokenOverride ? [request.options.proxyTokenOverride] : [];
+    const secrets = runtimeSecretValues(settings);
     const child = fork(workerPath, [], {
       cwd: this.projectRoot,
       silent: true,
-      env: {
-        ...process.env,
-        MAIL_TEMP_SHEET_ID: settings.sheetId,
-        MAIL_TEMP_SHEET_NAME: settings.sheetName,
-        GOOGLE_SERVICE_ACCOUNT_PATH: settings.serviceAccountPath,
-        GPM_API_BASE: settings.gpmApiBase,
-        MAIL_TEMP_RUNTIME_DIR: settings.runtimeDirectory,
-      },
+      env: createWorkerEnvironment(settings),
     });
     this.worker = child;
 
@@ -224,66 +368,18 @@ export class JobManager extends EventEmitter {
     attachLog(child.stdout);
     attachLog(child.stderr);
     child.on('message', (message: WorkerEventMessage | { kind: string; errorCount?: number; error?: string; focused?: boolean }) => {
-      if (message.kind === 'event') this.handleWorkerEvent(jobId, (message as WorkerEventMessage).event, secrets);
-      if (message.kind === 'focus-result') this.resolveFocusWaiters(jobId, Boolean(message.focused));
-      if (message.kind === 'completed') {
-        const state: JobStatus = this.shuttingDown
-          ? 'interrupted'
-          : message.errorCount ? 'completed_with_errors' : 'succeeded';
-        this.expectedExit.add(jobId);
-        this.transition(jobId, state, this.shuttingDown
-          ? 'Server đã dừng; job cần được retry thủ công'
-          : message.errorCount ? 'Hoàn thành với lỗi account' : 'Hoàn thành thành công', secrets);
-      }
-      if (message.kind === 'fatal') {
-        this.expectedExit.add(jobId);
-        this.transition(jobId, this.shuttingDown ? 'interrupted' : 'failed', this.shuttingDown
-          ? 'Server đã dừng; job cần được retry thủ công'
-          : message.error || 'Worker gặp lỗi nghiêm trọng', secrets);
-      }
-      if (message.kind === 'cancelled') {
-        this.expectedExit.add(jobId);
-        this.transition(jobId, this.shuttingDown ? 'interrupted' : 'cancelled', this.shuttingDown
-          ? 'Server đã dừng sau khi giải phóng tài nguyên; job cần được retry thủ công'
-          : 'Đã hủy và giải phóng tài nguyên', secrets);
-      }
-      if (message.kind === 'cleanup-failed') {
-        this.cleanupBlocked = true;
-        this.expectedExit.add(jobId);
-        this.transition(jobId, 'failed', `${message.error || 'Cleanup GPM thất bại'}; queue đã khóa để tránh chạy job kế tiếp`, secrets);
-      }
+      this.handleWorkerMessage(jobId, message, secrets);
     });
     child.once('error', (error) => {
       this.expectedExit.add(jobId);
       this.transition(jobId, 'failed', `Không thể khởi động worker: ${error.message}`, secrets);
     });
-    child.once('close', (code) => {
-      if (!this.expectedExit.has(jobId)) {
-        const forced = this.forcedTermination.has(jobId);
-        const current = this.store.get(jobId);
-        if (forced) {
-          this.cleanupBlocked = true;
-          this.transition(jobId, 'failed', 'Worker bị buộc dừng vì cleanup quá hạn; cần kiểm tra GPM profile');
-        } else if (current?.status === 'cancelling') {
-          this.transition(jobId, 'cancelled', 'Đã hủy và giải phóng tài nguyên');
-        } else {
-          this.transition(jobId, code === 0 ? 'succeeded' : 'failed', `Worker kết thúc với code ${code}`);
-        }
-      }
-      this.expectedExit.delete(jobId);
-      this.forcedTermination.delete(jobId);
-      this.privateRequests.delete(jobId);
-      this.seenRows.delete(jobId);
-      this.resolveFocusWaiters(jobId, false);
-      this.activeJobId = null;
-      this.worker = null;
-      this.accountService.invalidate();
-      void this.pump();
-    });
-    child.send({ kind: 'start', jobId, request, acceptedRows });
+    child.once('close', (code) => this.handleWorkerClose(jobId, code));
+    child.send({ kind: 'start', jobId, request, acceptedRows, acceptedAccounts });
   }
 
   private handleWorkerEvent(jobId: string, partial: WorkerEventMessage['event'], secrets: string[]): void {
+    this.store.validateEventPartial(partial);
     const current = this.store.get(jobId);
     if (!current) return;
     const changes: Partial<JobRecord> = { lastMessage: redactText(partial.message, secrets) };
@@ -341,14 +437,128 @@ export class JobManager extends EventEmitter {
     for (const finish of [...waiters]) finish(focused);
   }
 
+  private handleWorkerMessage(
+    jobId: string,
+    message: WorkerEventMessage | { kind: string; errorCount?: number; error?: string; focused?: boolean },
+    secrets: string[],
+  ): void {
+    if (message.kind === 'event') {
+      try {
+        this.handleWorkerEvent(jobId, (message as WorkerEventMessage).event, secrets);
+      } catch (error) {
+        this.cleanupBlocked = true;
+        this.expectedExit.add(jobId);
+        const detail = error instanceof Error ? error.message : 'invalid event payload';
+        this.transition(jobId, 'failed', `Worker gửi event không hợp lệ: ${detail}; queue đã khóa để kiểm tra cleanup`, secrets);
+        this.worker?.kill();
+        return;
+      }
+    }
+    if (message.kind === 'focus-result') this.resolveFocusWaiters(jobId, Boolean(message.focused));
+    if (message.kind === 'completed') {
+      const state: JobStatus = this.shuttingDown
+        ? 'interrupted'
+        : message.errorCount ? 'completed_with_errors' : 'succeeded';
+      this.expectedExit.add(jobId);
+      this.transition(jobId, state, this.shuttingDown
+        ? 'Server đã dừng; job cần được retry thủ công'
+        : message.errorCount ? 'Hoàn thành với lỗi account' : 'Hoàn thành thành công', secrets);
+    }
+    if (message.kind === 'fatal') {
+      this.expectedExit.add(jobId);
+      this.transition(jobId, this.shuttingDown ? 'interrupted' : 'failed', this.shuttingDown
+        ? 'Server đã dừng; job cần được retry thủ công'
+        : message.error || 'Worker gặp lỗi nghiêm trọng', secrets);
+    }
+    if (message.kind === 'cancelled') {
+      this.expectedExit.add(jobId);
+      this.transition(jobId, this.shuttingDown ? 'interrupted' : 'cancelled', this.shuttingDown
+        ? 'Server đã dừng sau khi giải phóng tài nguyên; job cần được retry thủ công'
+        : 'Đã hủy và giải phóng tài nguyên', secrets);
+    }
+    if (message.kind === 'cleanup-failed') {
+      this.clearCancelTimer(jobId);
+      this.cleanupBlocked = true;
+      this.expectedExit.add(jobId);
+      this.transition(jobId, 'failed', `${message.error || 'Cleanup GPM thất bại'}; queue đã khóa để tránh chạy job kế tiếp`, secrets);
+    }
+  }
+
+  private handleWorkerClose(jobId: string, code: number | null): void {
+    this.clearCancelTimer(jobId);
+    if (!this.expectedExit.has(jobId)) {
+      const forced = this.forcedTermination.has(jobId);
+      const current = this.store.get(jobId);
+      if (forced) {
+        this.cleanupBlocked = true;
+        this.transition(jobId, 'failed', 'Worker bị buộc dừng vì cleanup quá hạn; cần kiểm tra GPM profile');
+      } else if (current?.status === 'cancelling') {
+        this.transition(jobId, 'cancelled', 'Đã hủy và giải phóng tài nguyên');
+      } else {
+        this.transition(jobId, 'failed', `Worker kết thúc ngoài dự kiến với code ${code}`);
+      }
+    }
+    this.expectedExit.delete(jobId);
+    this.forcedTermination.delete(jobId);
+    this.privateRequests.delete(jobId);
+    this.seenRows.delete(jobId);
+    this.resolveFocusWaiters(jobId, false);
+    this.activeJobId = null;
+    this.worker = null;
+    this.accountService.invalidate();
+    void this.pump();
+  }
+
+  private clearCancelTimer(jobId: string): void {
+    const timeout = this.cancelTimers.get(jobId);
+    if (!timeout) return;
+    clearTimeout(timeout);
+    this.cancelTimers.delete(jobId);
+  }
+
+  private assertAutomationAvailable(): void {
+    const runtimeDirectory = this.configStore.get().runtimeDirectory;
+    let status: 'free' | 'busy' | 'stale';
+    try {
+      status = this.lockReader(runtimeDirectory).status;
+    } catch {
+      throw new AutomationLockConflictError('Không thể kiểm tra automation lock; chưa tạo job');
+    }
+    if (status !== 'free') {
+      throw new AutomationLockConflictError(`Automation lock đang ${status}; chưa tạo job`);
+    }
+    try {
+      this.automationAdmissionGuard(runtimeDirectory);
+    } catch (error) {
+      throw new AutomationLockConflictError(error instanceof Error ? error.message : 'Automation state chưa an toàn; chưa tạo job');
+    }
+  }
+
+  private async prepareRecoveryForJob(): Promise<void> {
+    if (!this.recoveryService) return;
+    const runtimeDirectory = this.configStore.get().runtimeDirectory;
+    let releaseGuard: () => void;
+    try {
+      releaseGuard = this.recoveryGuardAcquirer(runtimeDirectory);
+    } catch (error) {
+      throw new AutomationLockConflictError(error instanceof Error
+        ? error.message
+        : 'Không thể khóa recovery maintenance; chưa tạo job');
+    }
+    try {
+      this.assertAutomationAvailable();
+      await this.recoveryService.prepareForJob();
+    } finally {
+      releaseGuard();
+    }
+  }
+
   private toPublicRequest(request: JobRequest): PublicJobRequest {
     return {
       workflowId: request.workflowId,
       selection: request.selection,
       options: {
-        proxyMode: request.options.proxyMode,
         intervalMinutes: request.options.intervalMinutes,
-        hasProxyTokenOverride: Boolean(request.options.proxyTokenOverride),
       },
     };
   }

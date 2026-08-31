@@ -3,32 +3,19 @@
 // the pipeline depends on. Cheap to run, and it rules out the failures that would otherwise
 // only surface several minutes into a real signup.
 //
-// SP07 advertises IPv4 plans as reaching every site, but that has not held in practice: a
-// Vietnam IPv4 proxy reached Microsoft fine yet had ElevenLabs' CAPTCHA reject it, and a US
-// IPv4 proxy had login.live.com close the connection outright. Hence checking each host
-// individually rather than trusting one connectivity probe.
-//
 // What this CANNOT tell you: whether ElevenLabs' CAPTCHA will accept the IP. The CAPTCHA is a
 // JS widget scoring the client, so reaching the page proves nothing about passing it - only a
 // real signup run answers that.
 //
-//   node check-proxy.js --token=YOUR_TOKEN
-//   node check-proxy.js                      # falls back to the sheet's proxyToken column
+//   node check-proxy.js
 
-const { initSheets, loadRows } = require('./sheets');
-const { getNewProxyWithRetry, parseProxyString, fetchViaProxy } = require('./proxy');
+const { getNewProxyWithRetry, getNewTinProxyWithRetry, parseProxyString, fetchViaProxy } = require('./proxy');
 const { withAutomationLock } = require('./automation-lock');
+const { loadRuntimeConfig, resolveProxyConfig } = require('./runtime-config');
 
-async function resolveToken() {
-  if (process.env.MAIL_TEMP_PROXY_TOKEN_OVERRIDE) return process.env.MAIL_TEMP_PROXY_TOKEN_OVERRIDE;
-  const arg = process.argv.find((a) => a.startsWith('--token='));
-  if (arg) return arg.slice('--token='.length);
-
-  await initSheets();
-  const rows = await loadRows();
-  const token = rows.map((r) => r.proxyToken).find(Boolean);
-  if (!token) throw new Error('No token given and none found in the sheet\'s proxyToken column. Pass --token=YOUR_TOKEN.');
-  return token;
+function resolveConfig() {
+  const { provider, apiKey } = resolveProxyConfig(loadRuntimeConfig(), { required: true });
+  return { provider, token: apiKey };
 }
 
 const IP_ECHO_URL = 'https://api.ipify.org/?format=text';
@@ -42,14 +29,18 @@ const REQUIRED_HOSTS = [
 ];
 
 async function main() {
-  const token = await resolveToken();
+  const { provider, token } = resolveConfig();
 
   console.log('[1/4] Checking this machine\'s own IP (no proxy)...');
-  const directIp = (await (await fetch(IP_ECHO_URL)).text()).trim();
+  const directResponse = await fetch(IP_ECHO_URL, { signal: AbortSignal.timeout(15000) });
+  if (!directResponse.ok) throw new Error(`Direct IP check failed with HTTP ${directResponse.status}`);
+  const directIp = (await directResponse.text()).trim();
   console.log(`      Direct IP: ${directIp}`);
 
-  console.log('[2/4] Requesting a proxy from SP07...');
-  const proxyData = await getNewProxyWithRetry(token);
+  console.log(`[2/4] Requesting a proxy from ${provider}...`);
+  const proxyData = provider === 'tinproxy'
+    ? await getNewTinProxyWithRetry(token)
+    : await getNewProxyWithRetry(token);
   const proxy = parseProxyString(proxyData.proxy);
   console.log(`      Got: ${proxy.server} (${proxyData.country || '?'}, ${proxyData.type || '?'})`);
 
@@ -99,7 +90,7 @@ async function main() {
   } else {
     console.log('      All required hosts reachable. Whether ElevenLabs\' CAPTCHA accepts this IP');
     console.log('      is a separate question only a real signup run answers:');
-    console.log('        node signup-hotmail.js --row=<n> --proxy-token=<token>');
+    console.log('        node signup-hotmail.js --row=<n>');
   }
 }
 

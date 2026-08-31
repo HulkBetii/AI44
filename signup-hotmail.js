@@ -2,11 +2,28 @@ const { chromium } = require('playwright');
 const path = require('path');
 const fs = require('fs');
 const {
-  initSheets, loadRows, loadPendingRows, updateStatus, updatePassword, updateResult,
+  initSheets,
+  loadRows,
+  updatePasswordAndStatusByEmail,
+  updatePasswordByEmail,
+  updateResultByEmail,
+  updateStatusByEmail,
 } = require('./sheets');
-const { getNewProxyWithRetry, parseProxyString } = require('./proxy');
+const { getNewProxyWithRetry, parseProxyString, getNewTinProxyWithRetry } = require('./proxy');
+const { solveCaptcha } = require('./captcha-solver');
 const gpm = require('./gpm-api');
 const { withAutomationLock } = require('./automation-lock');
+const { loadRuntimeConfig, resolveProxyConfig } = require('./runtime-config');
+const { isEligibleForWorkflow } = require('./workflow-policy');
+const { generateSecurePassword } = require('./password-generator');
+const { collectSecretValues, collectUrlSecrets, redactSecrets } = require('./secret-sanitizer');
+const {
+  assertNoPreparedRecoveries,
+  confirmRecovery,
+  prepareRecovery,
+  removeRecovery,
+  syncConfirmedRecoveries,
+} = require('./recovery-journal');
 
 const FAILURE_SCREENSHOT = path.join(__dirname, 'debug-failure.png');
 const SUCCESS_CSV = path.join(__dirname, 'success_accounts.csv');
@@ -34,23 +51,79 @@ function appendLine(file, text) {
   }
   fs.appendFileSync(file, prefix + text + '\n', 'utf8');
 }
+
+function parseCsvRows(text) {
+  const rows = [];
+  let row = [];
+  let cell = '';
+  let inQuotes = false;
+  for (let index = 0; index < text.length; index++) {
+    const character = text[index];
+    if (inQuotes) {
+      if (character === Q && text[index + 1] === Q) {
+        cell += Q;
+        index++;
+      } else if (character === Q) {
+        inQuotes = false;
+      } else {
+        cell += character;
+      }
+    } else if (character === Q) {
+      inQuotes = true;
+    } else if (character === ',') {
+      row.push(cell);
+      cell = '';
+    } else if (character === '\n') {
+      row.push(cell);
+      rows.push(row);
+      row = [];
+      cell = '';
+    } else if (character !== '\r') {
+      cell += character;
+    }
+  }
+  if (cell || row.length > 0) {
+    row.push(cell);
+    rows.push(row);
+  }
+  return rows;
+}
+
+function fileHasLine(file, expected) {
+  if (!fs.existsSync(file)) return false;
+  return fs.readFileSync(file, 'utf8').split(/\r?\n/).includes(expected);
+}
+
 function appendSuccessCSV(cred, elevenPassword, apiKey, proxyString) {
-  if (!fs.existsSync(SUCCESS_CSV)) {
+  const csvExists = fs.existsSync(SUCCESS_CSV);
+  const alreadyInCsv = Boolean(apiKey && csvExists && parseCsvRows(
+    fs.readFileSync(SUCCESS_CSV, 'utf8'),
+  ).some((record, index) => index > 0 && record[5] === apiKey));
+  if (!csvExists || fs.statSync(SUCCESS_CSV).size === 0) {
     fs.writeFileSync(SUCCESS_CSV,
       'Timestamp,Email,HotmailPassword,ElevenPassword,RecoveryEmail,APIKey,Proxy\n', 'utf8');
   }
-  const row = [
-    new Date().toISOString(), cred.email, cred.password,
-    elevenPassword, cred.recoveryEmail, apiKey, proxyString,
-  ].map(csvCell).join(',') + '\n';
-  fs.appendFileSync(SUCCESS_CSV, row, 'utf8');
+  if (!alreadyInCsv) {
+    const row = [
+      new Date().toISOString(), cred.email, cred.password,
+      elevenPassword, cred.recoveryEmail, apiKey, proxyString,
+    ].map(csvCell).join(',') + '\n';
+    fs.appendFileSync(SUCCESS_CSV, row, 'utf8');
+  }
   
-  if (apiKey) {
+  if (apiKey && !fileHasLine(KEYS_TXT, apiKey)) {
     // A file whose last line has no newline - one written by hand, or by any other tool -
     // would otherwise have the next key appended onto the end of it, silently fusing two
     // keys into one unusable line. That already happened once to this file.
     appendLine(KEYS_TXT, apiKey);
   }
+}
+
+function persistCapturedCredentials(cred, proxyString) {
+  if (!cred.apiKeyCapturedThisRun || cred.capturedCredentialsPersisted) return false;
+  appendSuccessCSV(cred, cred.elevenPassword, cred.apiKey, proxyString);
+  cred.capturedCredentialsPersisted = true;
+  return true;
 }
 
 
@@ -66,6 +139,12 @@ const LIST_RENDER_TIMEOUT_MS = 20000; // Outlook's message list after a cold SPA
 const ONBOARDING_TIMEOUT_MS = 120000; // ElevenLabs adds onboarding steps; drive them in a loop
 const STEP_RENDER_TIMEOUT_MS = 20000; // the app shows a blank splash before each step mounts
 
+const LEGACY_PASSWORD_PATTERN = new RegExp(
+  '^(?:James|John|Robert|Michael|William|David|Richard|Joseph|Thomas|Charles|Mary|Patricia|Jennifer|Linda|Elizabeth|Barbara|Susan|Jessica|Sarah|Karen|Emma|Olivia|Ava|Isabella|Sophia|Mia|Amelia|Harper|Evelyn|Abigail)'
+  + '(?:Love|Life|Star|Moon|Sky|Blue|Green|Happy|Dream|Hope)'
+  + '(?:19(?:8[0-9]|9[0-9])|200[0-5])[@#!$]$',
+);
+
 // ── Module-scope state for failure handler ───────────────────────────────────
 let browser = null;
 let activePage = null;
@@ -73,15 +152,51 @@ let currentStep = 'init';
 // Module scope, not loop scope: a GPM profile outlives the process - it is a started browser
 // plus a folder on disk - so every exit path has to be able to see it and release it.
 let gpmProfileId = null;
+let profileCreateInFlight = null;
+let cancellationRequested = false;
 let activeRowIndex = null;
 let runReporter = null;
+let activeAccount = null;
+let activeRuntimeConfig = null;
+let activeProxyString = '';
+let activeAdditionalSecrets = [];
+
+function currentSecrets(account = activeAccount, extra = []) {
+  return collectSecretValues({
+    account,
+    runtimeConfig: activeRuntimeConfig,
+    extra: [activeProxyString, ...activeAdditionalSecrets, ...extra],
+  });
+}
+
+function safeErrorText(error, account = activeAccount, extra = []) {
+  return redactSecrets(error?.stack || error?.message || error, currentSecrets(account, extra));
+}
+
+function sanitizeEventValue(value, secrets) {
+  if (typeof value === 'string') return redactSecrets(value, secrets);
+  if (Array.isArray(value)) return value.map((item) => sanitizeEventValue(item, secrets));
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, item]) => [key, sanitizeEventValue(item, secrets)]),
+    );
+  }
+  return value;
+}
 
 function emitRunEvent(type, message, data = {}, level = 'info') {
   if (!runReporter || typeof runReporter.emit !== 'function') return;
   try {
-    runReporter.emit({ type, message, data, level, rowIndex: activeRowIndex });
+    const secrets = currentSecrets();
+    runReporter.emit({
+      type,
+      message: redactSecrets(message, secrets),
+      data: sanitizeEventValue(data, secrets),
+      level,
+      rowIndex: activeRowIndex,
+    });
   } catch (error) {
-    console.warn(`[reporter] ${error.message}`);
+    console.warn(`[reporter] ${safeErrorText(error)}`);
   }
 }
 
@@ -116,6 +231,10 @@ function releaseProfile() {
       emitRunEvent('cleanup.started', 'Đang đóng browser và GPM profile');
     }
     activePage = null;
+    if (profileCreateInFlight) {
+      const createdId = await profileCreateInFlight;
+      if (!gpmProfileId) gpmProfileId = createdId;
+    }
     if (browser) {
       // Just disconnect the CDP session
       await browser.close().catch(() => {});
@@ -131,13 +250,15 @@ function releaseProfile() {
 
     step('stop and delete GPM profile');
     await gpm.stopProfile(id)
-      .catch((e) => console.warn(`[GPM] stop failed for ${id}: ${e.message}`));
+      .catch((e) => console.warn(`[GPM] stop failed for ${id}: ${safeErrorText(e)}`));
     await new Promise((r) => setTimeout(r, 2000));
     // Report what actually happened: mode=2 removes the profile folder, so a run that
     // keeps failing here silently accumulates one directory per account.
     await gpm.deleteProfile(id).catch((error) => {
-      console.warn(`[GPM] DELETE FAILED for ${id}: ${error.message} - profile folder left on disk`);
-      throw new Error(`GPM profile cleanup failed for ${id}`);
+      console.warn(`[GPM] DELETE FAILED for ${id}: ${safeErrorText(error)} - profile folder left on disk`);
+      const cleanupError = new Error(`GPM profile cleanup failed for ${id}`);
+      cleanupError.preserveAutomationLock = true;
+      throw cleanupError;
     });
     gpmProfileId = null;
     console.log(`[GPM] Profile ${id} deleted.`);
@@ -149,24 +270,21 @@ function releaseProfile() {
   return releasing.finally(() => { releasing = null; });
 }
 
-// Ctrl+C killed the process outright, so neither the per-account finally nor the outer one
-// ran: the profile stayed started and its folder stayed on disk, one leaked per interrupted
-// run. Interrupting mid-account is routine here, so this is the common path, not the rare one.
-let shuttingDown = false;
-for (const sig of ['SIGINT', 'SIGTERM']) {
-  process.on(sig, () => {
-    if (shuttingDown) {
-      // Pressed twice: the operator wants out now. Say what is being abandoned so it can be
-      // removed by hand rather than lingering unnoticed.
-      console.error(`\n[${sig}] forced exit - profile ${gpmProfileId || '(none)'} left behind.`);
-      process.exit(130);
-    }
-    shuttingDown = true;
-    console.error(`\n[${sig}] received - releasing GPM profile before exit (Ctrl+C again to force)…`);
-    releaseProfile()
-      .catch((e) => console.error(`[cleanup] ${e.message}`))
-      .finally(() => process.exit(130));
-  });
+function installCliSignalHandlers(targetProcess = process) {
+  let shuttingDown = false;
+  for (const sig of ['SIGINT', 'SIGTERM']) {
+    targetProcess.on(sig, () => {
+      if (shuttingDown) {
+        console.error(`\n[${sig}] forced exit - profile ${gpmProfileId || '(none)'} left behind.`);
+        targetProcess.exit(130);
+      }
+      shuttingDown = true;
+      console.error(`\n[${sig}] received - releasing GPM profile before exit (Ctrl+C again to force)…`);
+      releaseProfile()
+        .catch((e) => console.error(`[cleanup] ${safeErrorText(e)}`))
+        .finally(() => targetProcess.exit(130));
+    });
+  }
 }
 
 const {
@@ -174,12 +292,132 @@ const {
 } = require('./human-behavior');
 
 function generatePassword() {
-  const { firstName } = generateRealisticName();
-  const words = ['Love', 'Life', 'Star', 'Moon', 'Sky', 'Blue', 'Green', 'Happy', 'Dream', 'Hope'];
-  const word = words[Math.floor(Math.random() * words.length)];
-  const year = Math.floor(Math.random() * (2005 - 1980 + 1)) + 1980;
-  const special = ['@', '#', '!', '$'][Math.floor(Math.random() * 4)];
-  return `${firstName}${word}${year}${special}`;
+  return generateSecurePassword();
+}
+
+async function createTrackedProfile(name, proxyString) {
+  if (profileCreateInFlight) throw new Error('A GPM profile create is already in flight');
+  const createPromise = gpm.createProfile(name, proxyString);
+  profileCreateInFlight = createPromise;
+  try {
+    const profileId = await createPromise;
+    gpmProfileId = profileId;
+    return profileId;
+  } finally {
+    if (profileCreateInFlight === createPromise) profileCreateInFlight = null;
+  }
+}
+
+function selectWeakPasswordRows(rows) {
+  return rows.filter((row) => LEGACY_PASSWORD_PATTERN.test(String(row.elevenPass || '')));
+}
+
+async function auditWeakPasswords() {
+  await initSheets();
+  const matches = selectWeakPasswordRows(await loadRows());
+  console.log(`Found ${matches.length} account(s) using the legacy weak password pattern.`);
+  for (const account of matches) console.log(`Row ${account.rowIndex}: ${account.email}`);
+  return matches.map(({ rowIndex, email }) => ({ rowIndex, email }));
+}
+
+function normalizeChoiceText(value) {
+  return String(value || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+}
+
+function microsoftLoginError(code, message) {
+  const error = new Error(message);
+  error.code = code;
+  return error;
+}
+
+async function detectMicrosoftLoginIssue(page) {
+  return page.evaluate(() => {
+    const isVisible = (selector) => {
+      const element = document.querySelector(selector);
+      if (!element) return false;
+      const style = getComputedStyle(element);
+      return style.display !== 'none' && style.visibility !== 'hidden'
+        && element.getBoundingClientRect().width > 0 && element.getBoundingClientRect().height > 0;
+    };
+    const visibleText = (selector) => {
+      const element = document.querySelector(selector);
+      if (!element || !isVisible(selector)) return '';
+      return (element.textContent || '').trim();
+    };
+    const credentialError = visibleText('#usernameError') || visibleText('#passwordError');
+    if (credentialError) {
+      const normalizedError = credentialError.replace(/\s+/g, ' ').trim().toLowerCase();
+      const confirmedCredentialPrefixes = [
+        'your account or password is incorrect',
+        'the account or password is incorrect',
+        'your password is incorrect',
+        "that microsoft account doesn't exist",
+        "we couldn't find an account with that username",
+      ];
+      const code = confirmedCredentialPrefixes.some((prefix) => normalizedError.startsWith(prefix))
+        ? 'MS_BAD_CREDENTIALS'
+        : 'MS_UI_CHANGED';
+      return { code, message: credentialError };
+    }
+    const hasPasswordChoice = [...document.querySelectorAll('span[role="button"], a, button, [role="button"]')]
+      .some((element) => {
+        const style = getComputedStyle(element);
+        const visible = style.display !== 'none' && style.visibility !== 'hidden'
+          && element.getBoundingClientRect().width > 0 && element.getBoundingClientRect().height > 0;
+        const text = String(element.textContent || '').normalize('NFD')
+          .replace(/[\u0300-\u036f]/g, '').toLowerCase();
+        return visible && (text.includes('use your password') || text.includes('su dung mat khau cua ban'));
+      });
+    if (hasPasswordChoice) return null;
+    if (isVisible('#iProofEmail')) {
+      return { code: 'MS_RECOVERY_REQUIRED', message: 'Microsoft requested manual account recovery' };
+    }
+    return null;
+  }).catch(() => null);
+}
+
+async function throwMicrosoftLoginIssue(page, fallbackMessage) {
+  const issue = await detectMicrosoftLoginIssue(page);
+  if (issue) throw microsoftLoginError(issue.code, `MS login: ${issue.message}`);
+  throw microsoftLoginError('MS_UI_CHANGED', fallbackMessage);
+}
+
+async function findVisiblePasswordChoice(page) {
+  const candidates = page.locator('span[role="button"], a, button, [role="button"]');
+  const count = await candidates.count();
+  for (let index = 0; index < count; index++) {
+    const candidate = candidates.nth(index);
+    if (!await candidate.isVisible().catch(() => false)) continue;
+    const text = normalizeChoiceText(await candidate.innerText().catch(() => ''));
+    if (text.includes('use your password') || text.includes('su dung mat khau cua ban')) {
+      return candidate;
+    }
+  }
+  return null;
+}
+
+async function activateMicrosoftPasswordRoute(page, route, click = clickHuman) {
+  let selectedRoute = route;
+  let passwordChoice = await findVisiblePasswordChoice(page);
+  if (passwordChoice) selectedRoute = 'link';
+  if (selectedRoute === 'proof' && !passwordChoice) {
+    passwordChoice = await page.waitForTimeout(1500).then(() => findVisiblePasswordChoice(page));
+    if (passwordChoice) selectedRoute = 'link';
+  }
+  if (selectedRoute === 'proof' && !passwordChoice) {
+    throw microsoftLoginError(
+      'MS_RECOVERY_REQUIRED',
+      'MS login: Microsoft is asking for manual account recovery (iProofEmail).',
+    );
+  }
+  if (selectedRoute === 'link' && !passwordChoice) {
+    throw microsoftLoginError('MS_UI_CHANGED', 'MS login: password choice disappeared before click');
+  }
+  if (selectedRoute === 'link') {
+    await click(page, passwordChoice);
+    await page.waitForTimeout(800 + Math.random() * 400);
+  }
+  return selectedRoute;
 }
 
 // ── Microsoft Outlook login ──────────────────────────────────────────────────
@@ -208,20 +446,34 @@ async function loginMicrosoft(ctx, hotmailEmail, hotmailPassword) {
   // The passkey/authenticator interstitial is conditional — accounts without one land on the
   // password field directly. Race the two so a missing prompt is not treated as a failure.
   step('MS login — switch to password');
-  const PASSWORD_LINK = 'span[role="button"]:has-text("Use your password")';
-  const route = await Promise.race([
-    loginPage.waitForSelector(PASSWORD_LINK, { timeout: MS_LOGIN_TIMEOUT_MS })
-      .then(() => 'link').catch(() => null),
-    loginPage.waitForSelector('#passwordEntry', { timeout: MS_LOGIN_TIMEOUT_MS })
-      .then(() => 'password').catch(() => null),
-  ]);
+  let route = await firstOutcome([
+    {
+      promise: loginPage.waitForFunction(() => {
+        const normalize = (value) => String(value || '').normalize('NFD')
+          .replace(/[\u0300-\u036f]/g, '').toLowerCase();
+        return [...document.querySelectorAll('span[role="button"], a, button, [role="button"]')]
+          .some((element) => {
+            const style = getComputedStyle(element);
+            const visible = style.display !== 'none' && style.visibility !== 'hidden'
+              && element.getBoundingClientRect().width > 0 && element.getBoundingClientRect().height > 0;
+            const text = normalize(element.textContent);
+            return visible && (text.includes('use your password') || text.includes('su dung mat khau cua ban'));
+          });
+      }, { timeout: MS_LOGIN_TIMEOUT_MS }),
+      value: 'link',
+    },
+    { promise: loginPage.waitForSelector('#passwordEntry', { timeout: MS_LOGIN_TIMEOUT_MS }), value: 'password' },
+    { promise: loginPage.waitForSelector('#iProofEmail', { timeout: MS_LOGIN_TIMEOUT_MS }), value: 'proof' },
+  ], MS_LOGIN_TIMEOUT_MS + 100);
+
   if (!route) {
-    throw new Error('MS login: neither the passkey link nor the password field appeared');
+    await throwMicrosoftLoginIssue(
+      loginPage,
+      'MS login: neither the password choice nor the password field appeared',
+    );
   }
-  if (route === 'link') {
-    await clickHuman(loginPage, PASSWORD_LINK);
-    await loginPage.waitForTimeout(800 + Math.random() * 400);
-  }
+
+  route = await activateMicrosoftPasswordRoute(loginPage, route);
 
   // Fill password (#passwordEntry)
   step('MS login — fill password');
@@ -233,6 +485,10 @@ async function loginMicrosoft(ctx, hotmailEmail, hotmailPassword) {
   step('MS login — submit password');
   await clickHuman(loginPage, 'button[data-testid="primaryButton"]');
   await loginPage.waitForTimeout(2000);
+  const submittedIssue = await detectMicrosoftLoginIssue(loginPage);
+  if (submittedIssue) {
+    throw microsoftLoginError(submittedIssue.code, `MS login: ${submittedIssue.message}`);
+  }
 
   // Dismiss passkey dialog if it appears (native OS dialog)
   step('MS login — dismiss passkey dialog');
@@ -263,10 +519,42 @@ async function loginMicrosoft(ctx, hotmailEmail, hotmailPassword) {
     await loginPage.waitForTimeout(1500);
   }
 
+  const delayedIssue = await detectMicrosoftLoginIssue(loginPage);
+  if (delayedIssue) {
+    throw microsoftLoginError(delayedIssue.code, `MS login: ${delayedIssue.message}`);
+  }
+
+  // Wait for post-login redirect to settle
+  await loginPage.waitForLoadState('domcontentloaded').catch(() => {});
+  await loginPage.waitForTimeout(2000);
+
   // Navigate to Outlook inbox (login.live.com redirects to account.microsoft.com by default)
   step('MS login — navigate to Outlook inbox');
-  await loginPage.goto('https://outlook.live.com/mail/', { waitUntil: 'domcontentloaded' });
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const currentUrl = loginPage.url();
+      if (!currentUrl.includes('outlook.live.com')) {
+        await loginPage.goto('https://outlook.live.com/mail/', { waitUntil: 'domcontentloaded', timeout: 30000 });
+      }
+      break;
+    } catch (err) {
+      if (attempt < 3 && /interrupted|net::ERR_ABORTED/i.test(err.message)) {
+        console.warn(`[MS] Inbox navigation interrupted (attempt ${attempt}/3), waiting for page to settle...`);
+        await loginPage.waitForLoadState('domcontentloaded').catch(() => {});
+        await loginPage.waitForTimeout(2500);
+        continue;
+      }
+      throw err;
+    }
+  }
   await loginPage.waitForTimeout(5000);
+  const inboxUrl = new URL(loginPage.url());
+  if (inboxUrl.hostname !== 'outlook.live.com') {
+    await throwMicrosoftLoginIssue(
+      loginPage,
+      `MS login did not reach Outlook inbox; redirected to ${safePageLocation(loginPage)}`,
+    );
+  }
   await dismissConsentDialog(loginPage);
   console.log(`[MS] Inbox loaded: ${safePageLocation(loginPage)}`);
 
@@ -364,9 +652,12 @@ async function dismissConsentDialog(page) {
 }
 
 // ── Poll Outlook inbox via DOM ────────────────────────────────────────────────
-async function pollOutlookInbox(outookPage, timeoutMs = INBOX_TIMEOUT_MS, mode = 'verifyEmail') {
-  // No step() here: the resume and reset paths set a more specific label immediately before
-  // calling this, and that label is what lands in the sheet's status column.
+async function pollOutlookInbox(
+  outookPage,
+  timeoutMs = INBOX_TIMEOUT_MS,
+  mode = 'verifyEmail',
+  notBefore = null,
+) {
   await think(3000, 7000); // Tầng 4: Nhịp thở tự nhiên khi nhận OTP
 
   const start = Date.now();
@@ -377,14 +668,10 @@ async function pollOutlookInbox(outookPage, timeoutMs = INBOX_TIMEOUT_MS, mode =
     try {
       // Alternate between Inbox and Junk Email to catch spam-routed emails
       const targetFolder = checkJunkNext ? 'junkemail' : 'inbox';
-      await outookPage.goto(`https://outlook.live.com/mail/0/${targetFolder}`, { waitUntil: 'domcontentloaded' });
+      await outookPage.goto(`https://outlook.live.com/mail/0/${targetFolder}`, { waitUntil: 'domcontentloaded' }).catch(() => {});
       checkJunkNext = !checkJunkNext;
 
-      // Outlook is a single-page app: domcontentloaded fires long before the message list is
-      // fetched and rendered. A fixed sleep was enough while this loop only reloaded an
-      // already-warm page, but navigating to a different folder each pass forces a full app
-      // boot - and a run then timed out while the verification mail sat visible in the inbox.
-      // Wait for the list itself; an empty folder simply falls through after the timeout.
+      // Wait for message list or folder to render
       await outookPage.waitForSelector('[role="option"]', { timeout: LIST_RENDER_TIMEOUT_MS })
         .catch(() => {});
 
@@ -400,17 +687,37 @@ async function pollOutlookInbox(outookPage, timeoutMs = INBOX_TIMEOUT_MS, mode =
       for (let i = 0; i < count; i++) {
         // Outlook renders each message row with role="option".
         const rowLocator = outookPage.locator('[role="option"]').filter({ hasText: 'ElevenLabs' }).nth(i);
+        if (notBefore) {
+          const receivedAt = await rowLocator.evaluate((row) => {
+            const time = row.querySelector('time[datetime]');
+            const raw = time?.getAttribute('datetime')
+              || row.getAttribute('data-received-at')
+              || row.getAttribute('data-timestamp')
+              || row.getAttribute('title')
+              || row.getAttribute('aria-label')
+              || time?.textContent
+              || '';
+            const numeric = Number(raw);
+            if (Number.isFinite(numeric) && numeric > 1e12) return numeric;
+            const parsed = Date.parse(raw);
+            return Number.isFinite(parsed) ? parsed : null;
+          }).catch(() => null);
+          // Outlook often renders only a localized clock value (for example "10:22 PM")
+          // without a machine-readable datetime. An unknown timestamp must remain a
+          // candidate; otherwise a fresh, visible reset email is skipped before it is clicked.
+          if (Number.isFinite(receivedAt) && receivedAt < notBefore) continue;
+        }
         await clickHuman(outookPage, rowLocator);
         await outookPage.waitForTimeout(2000);
 
         const body = await outookPage.evaluate(() => document.body.innerHTML);
-        const link = [...body.matchAll(/href="(https:\/\/elevenlabs\.io\/app\/action[^"]+)"/g)]
+        const links = [...body.matchAll(/href="(https:\/\/elevenlabs\.io\/app\/action[^"]+)"/g)]
           .map((m) => m[1].replace(/&amp;/g, '&'))
-          .find((u) => u.includes(wanted));
-        if (link) return link;
+          .filter((u) => u.includes(wanted));
+        if (links.length > 0) return links[links.length - 1];
       }
     } catch (e) {
-      console.log(`[inbox] scan error: ${e.message}`);
+      console.log(`[inbox] scan error: ${safeErrorText(e)}`);
     }
 
     console.log(`[inbox] No ${mode} email yet, waiting 5s...`);
@@ -419,16 +726,28 @@ async function pollOutlookInbox(outookPage, timeoutMs = INBOX_TIMEOUT_MS, mode =
 
   throw new Error(`Timeout: no ElevenLabs ${mode} email in Outlook inbox or junk folder`);
 }
-
 // ── Process one hotmail account end-to-end ───────────────────────────────────
-async function processAccount(ctx, cred) {
+async function processAccount(ctx, cred, proxyString = '') {
   const { rowIndex, email: hotmailEmail, password: hotmailPassword, recoveryEmail } = cred;
   const elevenPassword = generatePassword();
+  cred.elevenPassword = elevenPassword;
 
   console.log(`\n${'═'.repeat(60)}`);
   console.log(`▶ ${hotmailEmail}`);
   console.log(`${'═'.repeat(60)}`);
   console.log('  ElevenLabs password: [generated and stored securely]');
+
+  ctx.on('request', (req) => {
+    const url = req.url();
+    if (url.includes('hcaptcha.com') && (url.includes('req=') || url.includes('rqdata='))) {
+      const m = url.match(/[?&](?:req|rqdata)=([^&]+)/);
+      if (m) {
+        const rqdata = decodeURIComponent(m[1]);
+        const p = req.frame()?.page();
+        if (p) p.evaluate((r) => { window.__intercepted_rqdata = r; }, rqdata).catch(() => {});
+      }
+    }
+  });
 
   // 1. Login Microsoft → get Outlook inbox page
   const outookPage = await loginMicrosoft(ctx, hotmailEmail, hotmailPassword);
@@ -455,26 +774,72 @@ async function processAccount(ctx, cred) {
   await typeHuman(signupPage, '[data-testid="sign-up-password-input"]', elevenPassword);
   await signupPage.waitForTimeout(600 + Math.random() * 400);
 
+  const verificationRequestedAt = Date.now();
+  const recoveryEntry = prepareRecovery({
+    operation: 'signup',
+    email: hotmailEmail,
+    originalRowIndex: rowIndex,
+    elevenPassword,
+  });
   console.log('[2] Clicking Sign up...');
-  await clickHuman(signupPage, 'button[style*="view-transition-name: submit"]');
+  try {
+    await clickHuman(signupPage, 'button[style*="view-transition-name: submit"]');
 
-  // 3. Handle CAPTCHA
-  step('wait for signup (CAPTCHA may need manual solve)');
-  if (signupPage.url().includes('sign-up')) {
-    const settled = await waitForManualSignup(signupPage);
-    console.log(`[3] Signup complete (${settled})`);
+    // 3. Handle CAPTCHA — try auto-solve first, fall back to manual
+    step('wait for signup (CAPTCHA may need manual solve)');
+    if (signupPage.url().includes('sign-up')) {
+      const autoResult = await solveCaptcha(signupPage, proxyString).catch((err) => {
+        console.warn(`[captcha] Auto-solve threw: ${safeErrorText(err)}`);
+        return { solved: false, reason: err.message };
+      });
+
+      if (autoResult.solved) {
+        console.log(`[3] CAPTCHA auto-solved (${autoResult.solver}: ${autoResult.provider})`);
+        emitRunEvent('step.changed', `CAPTCHA auto-solved via ${autoResult.solver} (${autoResult.provider})`);
+        await signupPage.waitForTimeout(1500);
+
+        if (signupPage.url().includes('sign-up')) {
+          const submitBtn = await signupPage.$('button[style*="view-transition-name: submit"]');
+          if (submitBtn) {
+            console.log('[captcha] Submitting signup form with solved token...');
+            await submitBtn.evaluate(b => b.click()).catch(() => {});
+          }
+        }
+        console.log('[captcha] Waiting for page transition...');
+        await signupPage.waitForTimeout(8000);
+      }
+
+      if (signupPage.url().includes('sign-up')) {
+        if (!autoResult.solved) {
+          console.log(`[captcha] Auto-solve skipped: ${autoResult.reason}`);
+        } else {
+          console.log('[captcha] Token injected but page did not advance — falling back to manual');
+        }
+        const settled = await waitForManualSignup(signupPage);
+        console.log(`[3] Signup complete (${settled})`);
+      }
+    }
+  } catch (error) {
+    if (error.code === 'ALREADY_REGISTERED') removeRecovery(recoveryEntry.id);
+    throw error;
   }
-
-  // The ElevenLabs account exists from here on. Record its password immediately so a later
-  // failure (verify, onboarding, key creation) cannot leave the account unrecoverable.
-  await updatePassword(rowIndex, elevenPassword)
-    .catch((e) => console.error(`[sheet] password write failed: ${e.message}`));
 
   // 4. Poll Outlook inbox
   step('poll Outlook inbox for verify email');
   activePage = outookPage;
-  const verifyUrl = await pollOutlookInbox(outookPage, INBOX_TIMEOUT_MS);
+  const verifyUrl = await pollOutlookInbox(
+    outookPage,
+    INBOX_TIMEOUT_MS,
+    'verifyEmail',
+    verificationRequestedAt,
+  );
+  activeAdditionalSecrets.push(...collectUrlSecrets(verifyUrl));
   console.log('[4] Verify URL found securely.');
+
+  // A fresh verification email is positive evidence that the remote account was created.
+  confirmRecovery(recoveryEntry.id);
+  await updatePasswordByEmail(hotmailEmail, elevenPassword);
+  removeRecovery(recoveryEntry.id);
 
   // 5. Open verify URL
   step('open verify URL');
@@ -561,39 +926,62 @@ function firstOutcome(candidates, timeoutMs) {
   ]).finally(() => clearTimeout(timer));
 }
 
+const SIGN_IN_EMAIL_SELECTOR = '#sign-in-form input[type="email"], #sign-in-form input[name="email"], [data-testid="sign-in-email-input"]';
+const SIGN_IN_PASSWORD_SELECTOR = '#sign-in-form input[type="password"], #sign-in-form input[name="password"], [data-testid="sign-in-password-input"]';
+const SIGN_IN_SUBMIT_SELECTOR = '[data-testid="sign-in-submit-button"], #sign-in-form button[type="submit"], #sign-in-form button:has(.sr-only)';
+
 async function attemptSignIn(page, email, elevenPassword) {
   step('sign in ElevenLabs');
 
-  const formShown = await page.waitForSelector('[data-testid="sign-in-email-input"]', { timeout: 15000 })
+  const formShown = await page.waitForSelector(SIGN_IN_EMAIL_SELECTOR, { timeout: 10000 })
     .then(() => true).catch(() => false);
   if (!formShown) {
     // No form, and the URL has left the sign-in route: an existing session was reused and
     // the app went straight through. Nothing to submit.
-    if (!page.url().includes('/sign-in')) return SIGN_IN.OK;
+    if (!page.url().includes('sign-in')) return SIGN_IN.OK;
     throw new Error('Sign-in form never appeared');
   }
 
   // Let hydration finish before typing - the signup step already does this.
   await page.waitForTimeout(800 + Math.random() * 500);
-  await typeHuman(page, '[data-testid="sign-in-email-input"]', email);
+  await typeHuman(page, SIGN_IN_EMAIL_SELECTOR, email);
   await page.waitForTimeout(300);
-  await typeHuman(page, '[data-testid="sign-in-password-input"]', elevenPassword);
+  await typeHuman(page, SIGN_IN_PASSWORD_SELECTOR, elevenPassword);
   await page.waitForTimeout(400);
-  await clickHuman(page, '[data-testid="sign-in-submit-button"]');
+  await clickHuman(page, SIGN_IN_SUBMIT_SELECTOR);
+  await page.waitForTimeout(600);
+  if (page.url().includes('sign-in')) {
+    await page.keyboard.press('Enter').catch(() => {});
+  }
+
+  const rejectionMatcher = page.locator('text=/No user is found|Incorrect email|Incorrect password|Invalid credentials|Wrong password|Invalid email/i')
+    .or(page.getByText('No user is found', { exact: false }))
+    .or(page.getByText('Incorrect email', { exact: false }))
+    .or(page.getByText('Incorrect password', { exact: false }))
+    .or(page.getByText('Invalid credentials', { exact: false }))
+    .or(page.locator('[role="alert"], [data-testid="error-message"]'));
 
   const SETTLE_MS = 30000;
   const outcome = await firstOutcome([
     { value: SIGN_IN.OK,
-      promise: page.waitForURL((url) => !url.toString().includes('/sign-in'), { timeout: SETTLE_MS }) },
+      promise: page.waitForURL((url) => !url.toString().includes('sign-in'), { timeout: SETTLE_MS }) },
     // ElevenLabs keeps the URL on /sign-in for both of these, so match on the message.
     { value: SIGN_IN.UNVERIFIED,
       promise: page.getByText('verification link', { exact: false }).waitFor({ timeout: SETTLE_MS }) },
     { value: SIGN_IN.REJECTED,
-      promise: page.getByText('No user is found', { exact: false }).waitFor({ timeout: SETTLE_MS }) },
+      promise: rejectionMatcher.first().waitFor({ timeout: SETTLE_MS }) },
   ], SETTLE_MS);
 
   if (!outcome) {
-    const shown = await page.locator('[data-testid="sign-in-email-input"]')
+    if (!page.url().includes('sign-in')) return SIGN_IN.OK;
+    const bodyText = await page.evaluate(() => document.body.innerText).catch(() => '');
+    if (/No user is found|Incorrect email|Incorrect password|Invalid credentials|Wrong password|Invalid email/i.test(bodyText)) {
+      return SIGN_IN.REJECTED;
+    }
+    if (/verification link/i.test(bodyText)) {
+      return SIGN_IN.UNVERIFIED;
+    }
+    const shown = await page.locator(SIGN_IN_EMAIL_SELECTOR).first()
       .inputValue().catch(() => '<no field>');
     throw new Error(`Sign-in gave no recognised outcome (email field: "${shown}")`);
   }
@@ -661,7 +1049,7 @@ Last seen: ${lastSeen}`);
           const label = await opt.getAttribute('aria-label').catch(() => null);
           console.log(`[onboarding] Phân tán hành vi: chọn "${label || randIdx}" (${optCount} lựa chọn)`);
           await clickHuman(page, opt).catch((e) => {
-            console.warn(`[onboarding] random option click failed: ${e.message}`);
+            console.warn(`[onboarding] random option click failed: ${safeErrorText(e)}`);
           });
           await think(800, 1500);
         }
@@ -722,7 +1110,7 @@ Last seen: ${lastSeen}`);
 
       console.log(`[onboarding] ${lastSeen} -> "${label}"`);
       await clickHuman(page, control).catch((e) => {
-        console.warn(`[onboarding] click on "${label}" failed: ${e.message}`);
+        console.warn(`[onboarding] click on "${label}" failed: ${safeErrorText(e)}`);
       });
       await page.waitForTimeout(1500);
       advanced = true;
@@ -763,6 +1151,8 @@ Last seen: ${lastSeen}`);
 
   await grantAllPermissions(page);
 
+  // From this click onward the dialog may contain the one-time API key, even if reading it fails.
+  cred.apiKeyMayBeVisible = true;
   await page
     .getByRole('dialog')
     .getByRole('button', { name: 'Create Key', exact: true })
@@ -798,8 +1188,9 @@ Last seen: ${lastSeen}`);
   // update, the outer export still persists them locally without leaking them to stdout/logs.
   cred.apiKey = apiKey;
   cred.elevenPassword = elevenPassword;
+  cred.apiKeyCapturedThisRun = true;
 
-  await updateResult(cred.rowIndex, apiKey, elevenPassword, 'complete');
+  await updateResultByEmail(cred.email, apiKey, elevenPassword, 'complete');
 
   console.log(`\n✅ Done: ${cred.email}`);
   return apiKey;
@@ -832,6 +1223,7 @@ async function firstPresent(page, selectors, what) {
 async function resetPasswordAndCreateKey(ctx, cred) {
   const { rowIndex, email, password: hotmailPassword } = cred;
   const newPassword = generatePassword();
+  cred.elevenPassword = newPassword;
 
   console.log(`
 ${'═'.repeat(60)}`);
@@ -844,18 +1236,25 @@ ${'═'.repeat(60)}`);
   activePage = page;
   // The form has its own route, so go straight there instead of hunting for the link.
   await page.goto('https://elevenlabs.io/app/sign-in/forgot-password', { waitUntil: 'domcontentloaded' });
-  await page.waitForSelector('[data-testid="forgot-password-email-input"]', { timeout: 15000 });
+  const FORGOT_PASSWORD_EMAIL_SELECTOR = '[data-testid="forgot-password-email-input"], input[type="email"], input[name="email"], input[placeholder*="email" i]';
+  await page.waitForSelector(FORGOT_PASSWORD_EMAIL_SELECTOR, { timeout: 20000 });
   await page.waitForTimeout(800 + Math.random() * 500);
 
-  await typeHuman(page, '[data-testid="forgot-password-email-input"]', email);
+  await typeHuman(page, FORGOT_PASSWORD_EMAIL_SELECTOR, email);
   await page.waitForTimeout(400);
 
   // Continue starts disabled and enables once the address validates; clickHuman waits for that.
-  await clickHuman(page, page.getByRole('button', { name: 'Continue', exact: true }));
+  const resetRequestedAt = Date.now();
+  const continueBtn = page.getByRole('button', { name: 'Continue', exact: true })
+    .or(page.locator('button:has-text("Continue"), button[type="submit"]'));
+  await clickHuman(page, continueBtn);
 
   // Confirm the request actually went out. Without this a silent failure would send us to
   // the mailbox to wait two minutes for an email that was never sent.
-  await page.getByText('Check your Inbox', { exact: false })
+  await page.locator('text=/Check your Inbox|Check your email|sent you a link|sent a link/i')
+    .or(page.getByText('Check your Inbox', { exact: false }))
+    .or(page.getByText('Check your email', { exact: false }))
+    .first()
     .waitFor({ timeout: 20000 })
     .catch(() => {
       throw new Error(`Reset request not confirmed; still at ${safePageLocation(page)}`);
@@ -867,7 +1266,13 @@ ${'═'.repeat(60)}`);
   activePage = outlookPage;
 
   step('reset — poll Outlook for reset link');
-  const resetUrl = await pollOutlookInbox(outlookPage, INBOX_TIMEOUT_MS, 'resetPassword');
+  const resetUrl = await pollOutlookInbox(
+    outlookPage,
+    INBOX_TIMEOUT_MS,
+    'resetPassword',
+    resetRequestedAt,
+  );
+  activeAdditionalSecrets.push(...collectUrlSecrets(resetUrl));
   console.log('[reset] Reset URL found securely.');
 
   step('reset — set new password');
@@ -915,7 +1320,13 @@ ${'═'.repeat(60)}`);
     throw new Error('New password rejected by the form validator');
   }
 
-  await saveButton.click({ timeout: 10000 });
+  const recoveryEntry = prepareRecovery({
+    operation: 'resetPassword',
+    email,
+    originalRowIndex: rowIndex,
+    elevenPassword: newPassword,
+  });
+  await clickHuman(page, saveButton);
 
   // Confirm the reset landed before trusting the new password. The page leaves /app/action
   // on success; a lingering action URL means it did not take.
@@ -925,24 +1336,48 @@ ${'═'.repeat(60)}`);
     throw new Error('Password change was not confirmed by navigation');
   }
 
-  // Persist only once the change is confirmed, so column G never holds a password that was
-  // never actually set.
-  await updatePassword(rowIndex, newPassword);
+  await page.waitForTimeout(2000);
+  console.log(`[reset] Post-reset page location: ${safePageLocation(page)}`);
+  const postResetText = await page.evaluate(() => document.body.innerText || '').catch(() => '');
+  if (/something went wrong|expired|invalid/i.test(postResetText) && !/password has been changed/i.test(postResetText)) {
+    throw new Error(`Password reset rejected by ElevenLabs: ${postResetText.split('\n')[0] || 'Unknown error'}`);
+  }
 
   step('reset — sign in with new password');
-  // ElevenLabs returns to the login form by itself once the password is changed, so stay on
-  // this page. Opening a second tab raced that redirect and left an unnavigated about:blank.
-  if (!page.url().includes('/app/sign-in')) {
+  // ElevenLabs shows a "Password has been changed" confirmation with "Continue to Sign In"
+  const continueToSignInBtn = page.getByRole('button', { name: 'Continue to Sign In' })
+    .or(page.getByRole('link', { name: 'Continue to Sign In' }))
+    .or(page.locator('button:has-text("Continue to Sign In"), a:has-text("Continue to Sign In")'));
+  if (await continueToSignInBtn.isVisible({ timeout: 5000 }).catch(() => false)) {
+    await clickHuman(page, continueToSignInBtn);
+    await page.waitForTimeout(1500);
+  }
+
+  const currentUrl = page.url();
+  if (currentUrl !== 'https://elevenlabs.io/app/sign-in' && !currentUrl.endsWith('/app/sign-in')) {
     await page.goto('https://elevenlabs.io/app/sign-in', { waitUntil: 'domcontentloaded' });
   }
-  await page.waitForSelector('[data-testid="sign-in-email-input"]', { timeout: 20000 });
+  await page.waitForSelector(SIGN_IN_EMAIL_SELECTOR, { timeout: 20000 });
   await page.waitForTimeout(1000);
 
   const outcome = await attemptSignIn(page, email, newPassword);
   if (outcome !== SIGN_IN.OK) {
     throw new Error(`Sign-in still failed after password reset (${outcome})`);
   }
+
+  // Navigation away from the action URL can also be an expired/error redirect. Only a
+  // successful sign-in proves the new password is safe to persist.
+  confirmRecovery(recoveryEntry.id);
+  await updatePasswordByEmail(email, newPassword);
+  removeRecovery(recoveryEntry.id);
   await page.waitForTimeout(3000);
+
+  if (cred.apiKey) {
+    cred.elevenPassword = newPassword;
+    await updatePasswordAndStatusByEmail(email, newPassword, 'complete');
+    console.log(`[reset] Existing API key preserved for ${email}.`);
+    return cred.apiKey;
+  }
 
   await finishOnboardingAndKey(page, cred, newPassword);
 }
@@ -1000,7 +1435,7 @@ ${'═'.repeat(60)}`);
     // the stored password never matched. Recovering needs a password reset, which this script
     // does not do - flag it distinctly instead of leaving a misleading 'failed:<step>'.
     console.error(`[resume] Credentials rejected for ${email}; a password reset is required.`);
-    await updateStatus(rowIndex, 'credentials-rejected');
+    await updateStatusByEmail(email, 'credentials-rejected');
     return false;
   }
 
@@ -1013,6 +1448,7 @@ ${'═'.repeat(60)}`);
 
     step('resume — poll Outlook for verify email');
     const verifyUrl = await pollOutlookInbox(outlookPage, INBOX_TIMEOUT_MS);
+    activeAdditionalSecrets.push(...collectUrlSecrets(verifyUrl));
     console.log('[resume] Verify URL found securely.');
 
     step('resume — open verify URL');
@@ -1026,6 +1462,24 @@ ${'═'.repeat(60)}`);
     await page.waitForTimeout(2000);
 
     outcome = await attemptSignIn(page, email, elevenPass);
+    if (outcome === SIGN_IN.UNVERIFIED) {
+      console.log('[resume] Unverified notice shown on sign-in (fresh link auto-sent by ElevenLabs). Polling Outlook for fresh email...');
+      const verifyRequestedAt = Date.now() - 30000;
+
+      step('resume — poll Outlook for fresh verify email');
+      const freshVerifyUrl = await pollOutlookInbox(outlookPage, INBOX_TIMEOUT_MS, 'verifyEmail', verifyRequestedAt);
+      activeAdditionalSecrets.push(...collectUrlSecrets(freshVerifyUrl));
+
+      step('resume — open fresh verify URL');
+      await page.goto(freshVerifyUrl, { waitUntil: 'domcontentloaded' });
+
+      step('resume — click Continue');
+      await page.waitForSelector('button:has-text("Continue")', { timeout: 15000 });
+      await clickHuman(page, 'button:has-text("Continue")');
+      await page.waitForTimeout(2000);
+
+      outcome = await attemptSignIn(page, email, elevenPass);
+    }
     if (outcome !== SIGN_IN.OK) {
       throw new Error(`Sign-in still failed after verifying (${outcome})`);
     }
@@ -1038,24 +1492,46 @@ ${'═'.repeat(60)}`);
   await page.waitForTimeout(3000);
   await finishOnboardingAndKey(page, cred, elevenPass);
 }
-
 // ── Main loop ────────────────────────────────────────────────────────────────
 // --limit N  process at most N accounts (default: all)
 // --row N    process only the account on sheet row N
 function parseArgs(argv) {
-  const limitArg = argv.find((a) => a.startsWith('--limit='));
-  const rowArg = argv.find((a) => a.startsWith('--row='));
+  const booleanOptions = new Set([
+    '--resume',
+    '--reset-password',
+    '--regenerate-key',
+    '--no-proxy',
+    '--audit-weak-passwords',
+  ]);
+  const valueOptions = ['--limit=', '--row=', '--rows=', '--interval=', '--expected-email='];
+  for (const option of argv) {
+    if (booleanOptions.has(option) || valueOptions.some((prefix) => option.startsWith(prefix))) continue;
+    if (option === '--reset') {
+      throw new Error('Unknown option: --reset. Use --reset-password instead.');
+    }
+    throw new Error(`Unknown option: ${option}`);
+  }
+
+  const findValueOption = (prefix) => {
+    const matches = argv.filter((option) => option.startsWith(prefix));
+    if (matches.length > 1) throw new Error(`Option ${prefix.slice(0, -1)} may only be provided once`);
+    return matches[0] || null;
+  };
+
+  const limitArg = findValueOption('--limit=');
+  const rowArg = findValueOption('--row=');
   const resume = argv.includes('--resume');
   const resetPassword = argv.includes('--reset-password');
   const regenerateKey = argv.includes('--regenerate-key');
   const noProxy = argv.includes('--no-proxy');
-  const proxyTokenArg = argv.find((a) => a.startsWith('--proxy-token='));
-  const proxyToken = proxyTokenArg ? proxyTokenArg.slice('--proxy-token='.length) : null;
-  const rowsArg = argv.find((a) => a.startsWith('--rows='));
+  const auditWeakPasswords = argv.includes('--audit-weak-passwords');
+  const rowsArg = findValueOption('--rows=');
   const limit = limitArg ? Number(limitArg.split('=')[1]) : Infinity;
   const row = rowArg ? Number(rowArg.split('=')[1]) : null;
-  const intervalArg = argv.find((a) => a.startsWith('--interval='));
+  const intervalArg = findValueOption('--interval=');
   const interval = intervalArg ? Number(intervalArg.split('=')[1]) : 1; // Mặc định 1 phút
+  const expectedEmailArg = findValueOption('--expected-email=');
+  const expectedEmail = expectedEmailArg ? expectedEmailArg.slice('--expected-email='.length).trim() : null;
 
   if (limitArg && (!Number.isInteger(limit) || limit < 1)) {
     throw new Error(`--limit must be a positive integer, got: ${limitArg.split('=')[1]}`);
@@ -1065,6 +1541,9 @@ function parseArgs(argv) {
   }
   if (intervalArg && (!Number.isFinite(interval) || interval <= 0)) {
     throw new Error(`--interval must be a positive number, got: ${intervalArg.split('=')[1]}`);
+  }
+  if (expectedEmailArg && !expectedEmail) {
+    throw new Error('--expected-email must not be empty');
   }
 
   let rows = null;
@@ -1077,19 +1556,109 @@ function parseArgs(argv) {
   if (regenerateKey && !rows) {
     throw new Error('--regenerate-key needs --rows=<n,n,...> naming the rows to re-key');
   }
-
-  if (noProxy && proxyToken) {
-    throw new Error('--no-proxy and --proxy-token are mutually exclusive');
+  if (rows && !regenerateKey) {
+    throw new Error('--rows is only valid with --regenerate-key');
+  }
+  if (row !== null && rows) throw new Error('--row and --rows are mutually exclusive');
+  if ([resume, resetPassword, regenerateKey, auditWeakPasswords].filter(Boolean).length > 1) {
+    throw new Error('Workflow mode options are mutually exclusive');
+  }
+  for (const option of booleanOptions) {
+    if (argv.filter((candidate) => candidate === option).length > 1) {
+      throw new Error(`Option ${option} may only be provided once`);
+    }
+  }
+  if (expectedEmail && row === null && (!rows || rows.length !== 1)) {
+    throw new Error('--expected-email requires exactly one --row or --rows target');
+  }
+  if (auditWeakPasswords && (limitArg || rowArg || rowsArg || intervalArg || expectedEmailArg || noProxy)) {
+    throw new Error('--audit-weak-passwords cannot be combined with automation options');
   }
 
-  return { limit, row, rows, resume, resetPassword, regenerateKey, noProxy, proxyToken, interval };
+  return {
+    limit,
+    row,
+    rows,
+    resume,
+    resetPassword,
+    regenerateKey,
+    noProxy,
+    interval,
+    expectedEmail,
+    auditWeakPasswords,
+  };
 }
 
-async function run(argv = process.argv.slice(2), reporter = null) {
+function selectWorkflowRows(allRows, workflowId, { row = null, explicitReset = false } = {}) {
+  return allRows.filter((account) => (row === null || account.rowIndex === row)
+    && isEligibleForWorkflow(account, workflowId, { explicitReset }));
+}
+
+function selectResetPasswordRows(allRows, row, { explicitReset = row !== null } = {}) {
+  return selectWorkflowRows(allRows, 'resetPassword', { row, explicitReset });
+}
+
+function assertSafeAccountIdentities(selectedRows, allRows = selectedRows) {
+  for (const account of selectedRows) {
+    const normalizedEmail = String(account.email || '').trim().toLowerCase();
+    if (!normalizedEmail) {
+      throw new Error(`Sheet row ${account.rowIndex} has no email identity; refusing automation`);
+    }
+    const matches = allRows.filter(
+      (candidate) => String(candidate.email || '').trim().toLowerCase() === normalizedEmail,
+    );
+    if (matches.length !== 1) {
+      throw new Error(
+        `Account identity ${account.email} is not unique; found ${matches.length} matching Sheet rows`,
+      );
+    }
+  }
+  return selectedRows;
+}
+
+async function run(argv = process.argv.slice(2), reporter = null, executionOptions = {}) {
+  cancellationRequested = false;
   runReporter = reporter;
-  const { limit, row, rows, resume, resetPassword, regenerateKey, noProxy, proxyToken, interval } = parseArgs(argv);
+  const {
+    limit, row, rows, resume, resetPassword, regenerateKey, noProxy, interval, expectedEmail,
+    auditWeakPasswords: auditOnly,
+  } = parseArgs(argv);
+
+  if (auditOnly) {
+    try {
+      return await auditWeakPasswords();
+    } finally {
+      runReporter = null;
+    }
+  }
+
+  const explicitReset = executionOptions.explicitReset
+    ?? (resetPassword && row !== null && !expectedEmail);
+
+  const runtimeConfig = loadRuntimeConfig();
+  activeRuntimeConfig = runtimeConfig;
+  const proxyConfig = noProxy
+    ? { provider: 'none', apiKey: null }
+    : resolveProxyConfig(runtimeConfig);
 
   await initSheets();
+  await syncConfirmedRecoveries({ updatePasswordByEmail });
+  assertNoPreparedRecoveries();
+  const allRows = await loadRows();
+  if (expectedEmail) {
+    const expectedRowIndex = row === null ? rows[0] : row;
+    const current = allRows.find((account) => account.rowIndex === expectedRowIndex);
+    if (!current || current.email.trim().toLowerCase() !== expectedEmail.toLowerCase()) {
+      throw new Error(`Sheet row identity changed; expected ${expectedEmail} at row ${expectedRowIndex}`);
+    }
+    const workflowId = regenerateKey ? 'regenerateKey'
+      : resetPassword ? 'resetPassword'
+      : resume ? 'resume'
+      : 'signup';
+    if (!isEligibleForWorkflow(current, workflowId, { explicitReset })) {
+      throw new Error(`Account ${expectedEmail} is no longer eligible for ${workflowId}`);
+    }
+  }
 
   // --resume targets accounts that already exist: a password was recorded but no key was
   // ever captured. Returning these to 'pending' would not work - signup rejects the email
@@ -1098,8 +1667,7 @@ async function run(argv = process.argv.slice(2), reporter = null) {
   if (regenerateKey) {
     // Named explicitly: nothing in the sheet records how a key's permissions were granted,
     // so which rows need re-keying is a judgement only the operator can make.
-    const all = await loadRows();
-    pendingRows = all.filter((r) => rows.includes(r.rowIndex));
+    pendingRows = allRows.filter((r) => rows.includes(r.rowIndex));
     const missing = rows.filter((n) => !pendingRows.some((r) => r.rowIndex === n));
     if (missing.length) throw new Error(`No such row(s) in the sheet: ${missing.join(', ')}`);
     const noPassword = pendingRows.filter((r) => !r.elevenPass);
@@ -1108,27 +1676,28 @@ async function run(argv = process.argv.slice(2), reporter = null) {
     }
     console.log(`Re-keying ${pendingRows.length} account(s): rows ${rows.join(', ')}`);
   } else if (resetPassword) {
-    // Rows --resume gave up on: the account exists but the stored password does not open it.
-    // 'already-registered' belongs here too - sign-up found the address taken, so an account
-    // exists whose password was never recorded, and a reset is the only way back into it.
-    const RESETTABLE = ['credentials-rejected', 'already-registered'];
-    pendingRows = (await loadRows()).filter((r) => RESETTABLE.includes(r.status));
-    console.log(`Loaded ${pendingRows.length} account(s) needing a password reset`);
+    // Bulk mode remains conservative, while an explicitly named row is an operator override.
+    pendingRows = selectResetPasswordRows(allRows, row, { explicitReset });
+    console.log(row === null
+      ? `Loaded ${pendingRows.length} account(s) needing a password reset`
+      : `Loaded ${pendingRows.length} account(s) selected for password reset`);
   } else if (resume) {
-    pendingRows = (await loadRows()).filter(
-      (r) => r.status !== 'complete' && r.elevenPass && !r.apiKey,
-    );
+    pendingRows = selectWorkflowRows(allRows, 'resume');
     console.log(`Loaded ${pendingRows.length} resumable accounts from Google Sheet`);
   } else {
-    pendingRows = await loadPendingRows();
+    pendingRows = selectWorkflowRows(allRows, 'signup');
     console.log(`Loaded ${pendingRows.length} pending accounts from Google Sheet`);
   }
 
   if (row !== null) {
     pendingRows = pendingRows.filter((r) => r.rowIndex === row);
     if (pendingRows.length === 0) {
-      console.log(`Row ${row} is not pending (or does not exist). Exiting.`);
-      return;
+      console.log(resetPassword
+        ? `Row ${row} does not exist. Exiting.`
+        : `Row ${row} is not pending (or does not exist). Exiting.`);
+      runReporter = null;
+      activeRuntimeConfig = null;
+      return { processedAccounts: 0 };
     }
   }
 
@@ -1140,28 +1709,24 @@ async function run(argv = process.argv.slice(2), reporter = null) {
   if (pendingRows.length === 0) {
     const what = resetPassword ? 'accounts needing a reset' : resume ? 'resumable accounts' : 'pending accounts';
     console.log(`No ${what}. Exiting.`);
-    return;
+    runReporter = null;
+    activeRuntimeConfig = null;
+    return { processedAccounts: 0 };
   }
 
-  // Find a default proxy token if user only filled one cell
-  let defaultToken = null;
-  if (proxyToken) {
-    defaultToken = proxyToken;
-    console.log('\n[proxy] Using --proxy-token for this run (overrides the sheet).');
-  } else if (noProxy) {
-    console.log('\n[proxy] --no-proxy: skipping proxy rotation for this run.');
-  } else {
-    const allRowsForToken = await loadRows();
-    const availableTokens = [...new Set(allRowsForToken.map((r) => r.proxyToken).filter(Boolean))];
-    defaultToken = availableTokens.length > 0 ? availableTokens[0] : null;
-    if (defaultToken) {
-      console.log(`\n[proxy] Global proxy token found (${availableTokens.length} total). Will fallback to this token if a row is empty.`);
-    }
+  assertSafeAccountIdentities(pendingRows, allRows);
+
+  if (noProxy) {
+    console.log('\n[proxy] --no-proxy: skipping proxy for this run.');
   }
 
   // The browser will be launched per-account via GPM-Login API.
   for (let i = 0; i < pendingRows.length; i++) {
     const cred = pendingRows[i];
+    const existingApiKey = cred.apiKey;
+    activeAccount = cred;
+    activeProxyString = '';
+    activeAdditionalSecrets = [existingApiKey];
     activeRowIndex = cred.rowIndex;
     console.log(`\n[${i + 1}/${pendingRows.length}] ${cred.email} (sheet row ${cred.rowIndex})`);
     emitRunEvent('account.started', `Bắt đầu ${cred.email}`, {
@@ -1177,33 +1742,64 @@ async function run(argv = process.argv.slice(2), reporter = null) {
     // loadRows fills apiKey from column F, so a row that already had a key would otherwise
     // look successful even when this run failed - a failed --regenerate-key wrote a CSV entry
     // carrying the stale key and an undefined password. Only this run may set these.
-    cred.apiKey = null;
+    cred.apiKey = resetPassword ? existingApiKey : null;
     cred.elevenPassword = null;
+    cred.apiKeyMayBeVisible = false;
+    cred.apiKeyCapturedThisRun = false;
+    cred.capturedCredentialsPersisted = false;
 
     // One context per account. A fresh context drops cookies, localStorage and IndexedDB, so
     // the previous account's Microsoft session cannot leak into this login. Closing it also
     // disposes every tab the account opened.
     
     let proxyString = '';
-    const activeToken = noProxy ? null : (proxyToken || cred.proxyToken || defaultToken);
-    if (activeToken) {
-      step('rotate proxy');
-      console.log(`[proxy] Fetching new proxy using token...`);
-      try {
-        const proxyData = await getNewProxyWithRetry(activeToken);
-        proxyString = proxyData.proxy; // Dạng IP:Port:User:Pass
-        console.log('[proxy] Proxy acquired securely.');
-      } catch (err) {
-        console.error(`\n❌ FAILED [${cred.email}] at step: proxy rotation`);
-        console.error(err.stack || err.message);
-        await updateStatus(cred.rowIndex, 'failed:proxy_api').catch(() => {});
-        emitRunEvent('account.failed', 'Không thể rotate proxy', {
-          email: cred.email,
-          step: 'proxy rotation',
-          status: 'failed:proxy_api',
-          error: err.message,
-        }, 'error');
-        continue;
+    // --- Proxy rotation: TinProxy FPT or SP07 ---
+    if (proxyConfig.provider !== 'none') {
+      if (proxyConfig.provider === 'tinproxy') {
+        step('rotate proxy (TinProxy)');
+        try {
+          const proxyData = await getNewTinProxyWithRetry(proxyConfig.apiKey);
+          proxyString = proxyData.proxy;
+          activeProxyString = proxyString;
+          console.log('[proxy] Proxy acquired securely.');
+        } catch (err) {
+          console.error(`\n❌ FAILED [${cred.email}] at step: proxy rotation`);
+          console.error(safeErrorText(err));
+          await updateStatusByEmail(cred.email, 'failed:proxy_api');
+          emitRunEvent('account.failed', 'Không thể rotate proxy', {
+            email: cred.email,
+            step: 'proxy rotation',
+            status: 'failed:proxy_api',
+            error: err.message,
+          }, 'error');
+          activeAccount = null;
+          activeProxyString = '';
+          activeAdditionalSecrets = [];
+          continue;
+        }
+      } else if (proxyConfig.provider === 'sp07') {
+        step('rotate proxy (SP07)');
+        console.log('[proxy] Fetching new proxy from SP07...');
+        try {
+          const proxyData = await getNewProxyWithRetry(proxyConfig.apiKey);
+          proxyString = proxyData.proxy;
+          activeProxyString = proxyString;
+          console.log('[proxy] Proxy acquired securely.');
+        } catch (err) {
+          console.error(`\n❌ FAILED [${cred.email}] at step: proxy rotation`);
+          console.error(safeErrorText(err));
+          await updateStatusByEmail(cred.email, 'failed:proxy_api');
+          emitRunEvent('account.failed', 'Không thể rotate proxy', {
+            email: cred.email,
+            step: 'proxy rotation',
+            status: 'failed:proxy_api',
+            error: err.message,
+          }, 'error');
+          activeAccount = null;
+          activeProxyString = '';
+          activeAdditionalSecrets = [];
+          continue;
+        }
       }
     }
 
@@ -1212,8 +1808,9 @@ async function run(argv = process.argv.slice(2), reporter = null) {
 
     try {
       step('create GPM profile');
-      gpmProfileId = await gpm.createProfile(cred.email, proxyString);
+      gpmProfileId = await createTrackedProfile(cred.email, proxyString);
       console.log(`[GPM] Created profile ${gpmProfileId}`);
+      if (cancellationRequested) throw new Error('Job cancelled');
       
       step('start GPM profile');
       const debugAddress = await gpm.startProfile(gpmProfileId);
@@ -1231,7 +1828,7 @@ async function run(argv = process.argv.slice(2), reporter = null) {
       if (regenerateKey) workflowResult = await regenerateAccountKey(ctx, cred);
       else if (resetPassword) workflowResult = await resetPasswordAndCreateKey(ctx, cred);
       else if (resume) workflowResult = await resumeAccount(ctx, cred);
-      else workflowResult = await processAccount(ctx, cred);
+      else workflowResult = await processAccount(ctx, cred, proxyString);
       if (workflowResult === false) {
         emitRunEvent('account.failed', 'Credential ElevenLabs bị từ chối; cần reset mật khẩu', {
           email: cred.email,
@@ -1243,30 +1840,35 @@ async function run(argv = process.argv.slice(2), reporter = null) {
       }
     } catch (err) {
       console.error(`\n❌ FAILED [${cred.email}] at step: ${currentStep}`);
-      console.error(err.stack || err.message);
+      console.error(safeErrorText(err));
 
       // Classify failure: MS login steps = account inactive/bad creds.
       // But a transport failure (proxy refusing, connection closed, DNS) says nothing about
       // the mailbox - the credentials were never even submitted. Calling that 'inactive'
       // tells the operator to write off a perfectly good account; observed when a US proxy
       // could not reach login.live.com and the row was marked dead.
-      const isNetworkError = /net::ERR_/.test(err.message || '');
-      const isInactive = !resume && !resetPassword && !regenerateKey
-        && currentStep.startsWith('MS login') && !isNetworkError;
+      const isNetworkError = err.code === 'MS_NETWORK'
+        || /net::ERR_|ECONNRESET|ECONNREFUSED|ENOTFOUND|ETIMEDOUT|socket hang up|fetch failed/i
+          .test(`${err.code || ''} ${err.message || ''}`);
+      const isInactive = err.code === 'MS_BAD_CREDENTIALS';
       // A refused address and an unsolved CAPTCHA both fail on the sign-up step, but they need
       // opposite recoveries: one is a plain retry, the other means an ElevenLabs account
       // already exists whose password was never recorded, so only --reset-password can reach
       // it. Sharing one 'failed:<step>' label would hide that, exactly as network failures
       // once hid behind 'inactive'.
       const failStatus = err.code === 'ALREADY_REGISTERED' ? 'already-registered'
+        : err.code === 'MS_RECOVERY_REQUIRED' ? 'need to recover password'
         : isNetworkError ? 'failed:network'
         : isInactive ? 'inactive'
         : `failed:${currentStep}`;
 
       // Status column only. Never blank F/G here: the ElevenLabs account may already exist
       // with its password recorded, and losing it would orphan the account for good.
-      await updateStatus(cred.rowIndex, failStatus)
-        .catch((e) => console.error(`[sheet] status write failed: ${e.message}`));
+      await updateStatusByEmail(cred.email, failStatus)
+        .catch((e) => {
+          console.error(`[sheet] status write failed: ${safeErrorText(e)}`);
+          throw e;
+        });
       emitRunEvent('account.failed', `Thất bại tại ${currentStep}`, {
         email: cred.email,
         step: currentStep,
@@ -1274,32 +1876,63 @@ async function run(argv = process.argv.slice(2), reporter = null) {
         error: err.message,
       }, 'error');
 
+      if (err.code === gpm.GPM_CREATE_UNCERTAIN) throw err;
+
       if (!activePage || activePage.isClosed()) {
         console.error(`[debug] No page to capture (activePage ${activePage ? 'was closed' : 'was never set'})`);
       }
-      if (activePage && !activePage.isClosed()) {
+      if (cred.apiKeyMayBeVisible) {
+        console.error('[debug] Screenshot skipped because the page may contain a captured API key.');
+      } else if (activePage && !activePage.isClosed()) {
         try {
           console.error(`[debug] Page: ${safePageLocation(activePage)}`);
           const text = await activePage.evaluate(() => document.body.innerText.slice(0, 600));
-          console.error(`[debug] Visible text:\n${text}`);
+          console.error(`[debug] Visible text:\n${redactSecrets(text, currentSecrets())}`);
           // Per-row filename: a shared path meant each failure erased the previous evidence.
           const shot = FAILURE_SCREENSHOT.replace(/\.png$/, `-row${cred.rowIndex}.png`);
-          await activePage.screenshot({ path: shot, fullPage: true });
+          await activePage.screenshot({
+            path: shot,
+            fullPage: true,
+            mask: [activePage.locator('input[type="password"]')],
+          });
           console.error(`[debug] Screenshot: ${shot}`);
           emitRunEvent('artifact.created', 'Đã lưu screenshot lỗi', { path: shot, kind: 'screenshot' }, 'warning');
         } catch (e) {
-          console.error(`[debug] Capture failed: ${e.message}`);
+          console.error(`[debug] Capture failed: ${safeErrorText(e)}`);
         }
       }
 
+      // An uncertain remote password mutation must stop this batch before another account
+      // starts. The journal is the operator's recovery boundary, not just a startup check.
+      assertNoPreparedRecoveries();
       console.log('Continuing to next account...');
     } finally {
-      await releaseProfile();
-    }
-
-    // Tầng 4: Export tài khoản thành công ra CSV
-    if (cred.apiKey) {
-      appendSuccessCSV(cred, cred.elevenPassword, cred.apiKey, proxyString);
+      let persistenceError = null;
+      let cleanupError = null;
+      try {
+        persistCapturedCredentials(cred, proxyString);
+      } catch (error) {
+        persistenceError = error;
+        console.error(`[export] Captured credential persistence failed: ${safeErrorText(error)}`);
+      }
+      try {
+        await releaseProfile();
+      } catch (error) {
+        cleanupError = error;
+      }
+      activeAccount = null;
+      activeProxyString = '';
+      activeAdditionalSecrets = [];
+      if (persistenceError && cleanupError) {
+        const combinedError = new AggregateError(
+          [persistenceError, cleanupError],
+          'Captured credential persistence and GPM profile cleanup both failed',
+        );
+        combinedError.preserveAutomationLock = true;
+        throw combinedError;
+      }
+      if (persistenceError) throw persistenceError;
+      if (cleanupError) throw cleanupError;
     }
 
     // Tầng 4: Phân bố Poisson - Delay ngẫu nhiên giữa các luồng
@@ -1323,10 +1956,16 @@ async function run(argv = process.argv.slice(2), reporter = null) {
 
   console.log('\n✅ All accounts processed.');
   activeRowIndex = null;
+  activeAccount = null;
+  activeProxyString = '';
+  activeAdditionalSecrets = [];
   runReporter = null;
+  activeRuntimeConfig = null;
+  return { processedAccounts: pendingRows.length };
 }
 
 async function cancelActiveRun() {
+  cancellationRequested = true;
   emitRunEvent('job.state', 'Đang hủy lượt chạy', { status: 'cancelling' }, 'warning');
   await releaseProfile();
 }
@@ -1338,16 +1977,32 @@ async function focusActiveBrowser() {
 }
 
 if (require.main === module) {
-  withAutomationLock('signup-cli', () => run())
+  installCliSignalHandlers();
+  const executeCli = process.argv.slice(2).includes('--audit-weak-passwords')
+    ? () => run()
+    : () => withAutomationLock('signup-cli', () => run());
+  executeCli()
     .catch(async (err) => {
-      console.error('\n❌ Fatal error:', err.stack || err.message);
+      console.error('\n❌ Fatal error:', safeErrorText(err));
       process.exitCode = 1;
     })
     .finally(async () => {
       // A throw outside the per-account try - proxy setup, sheet init - skips the finally that
       // normally releases the profile, so the outer path has to release it too.
-      await releaseProfile().catch((err) => console.error(`[cleanup] ${err.message}`));
+      await releaseProfile().catch((err) => console.error(`[cleanup] ${safeErrorText(err)}`));
     });
 }
 
-module.exports = { run, parseArgs, releaseProfile, cancelActiveRun, focusActiveBrowser };
+module.exports = {
+  activateMicrosoftPasswordRoute,
+  assertSafeAccountIdentities,
+  auditWeakPasswords,
+  cancelActiveRun,
+  focusActiveBrowser,
+  parseArgs,
+  releaseProfile,
+  run,
+  selectResetPasswordRows,
+  selectWorkflowRows,
+  selectWeakPasswordRows,
+};

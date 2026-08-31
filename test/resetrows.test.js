@@ -1,5 +1,10 @@
 const assert = require('assert');
-const { parseArgs, selectRows } = require('../reset-rows.js');
+const fs = require('fs');
+const path = require('path');
+const { assertResetCandidatesUnchanged, parseArgs, selectRows } = require('../reset-rows.js');
+
+const resetSource = fs.readFileSync(path.join(__dirname, '..', 'reset-rows.js'), 'utf8');
+assert.ok(resetSource.includes('await resolveUniqueRowsByEmail(candidates.map((candidate) => candidate.email))'));
 
 // reset-rows.js is the only way a burned row gets back into the queue, and it writes to the
 // live sheet. It used to be all-or-nothing: every non-complete, non-pending row went back to
@@ -25,6 +30,26 @@ const SHEET = [
   { rowIndex: 37, email: 'queued@x.com',  status: 'pending',                   apiKey: '',       elevenPass: '' },
 ];
 const idx = (r) => r.rowIndex;
+
+const selectedBeforeMove = [{
+  rowIndex: 25,
+  email: 'signup@x.com',
+  status: 'failed:sign-up elevenlabs',
+  apiKey: '',
+  elevenPass: '',
+}];
+assert.deepStrictEqual(
+  assertResetCandidatesUnchanged(selectedBeforeMove, [{ ...selectedBeforeMove[0], rowIndex: 42 }])
+    .map(idx),
+  [42],
+);
+assert.throws(
+  () => assertResetCandidatesUnchanged(selectedBeforeMove, [{
+    ...selectedBeforeMove[0], rowIndex: 42, apiKey: 'sk_created_during_preview',
+  }]),
+  /changed since preview/,
+);
+console.log('✓ destructive reset follows a moved identity but refuses changed credentials/state');
 
 // ── parseArgs ────────────────────────────────────────────────────────────────
 

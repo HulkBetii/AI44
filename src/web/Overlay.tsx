@@ -61,6 +61,7 @@ export interface OverlayProps {
   labelledBy?: string;
   describedBy?: string;
   initialFocusRef?: RefObject<HTMLElement | null>;
+  getRestoreFocusTarget?: () => HTMLElement | null;
   closeOnBackdrop?: boolean;
 }
 
@@ -74,9 +75,12 @@ export function Overlay({
   labelledBy,
   describedBy,
   initialFocusRef,
+  getRestoreFocusTarget,
   closeOnBackdrop = true,
 }: OverlayProps) {
   const panelRef = useRef<HTMLElement | null>(null);
+  const getRestoreFocusTargetRef = useRef(getRestoreFocusTarget);
+  getRestoreFocusTargetRef.current = getRestoreFocusTarget;
 
   useLayoutEffect(() => {
     const restoreFocusTo = document.activeElement instanceof HTMLElement ? document.activeElement : null;
@@ -89,7 +93,9 @@ export function Overlay({
 
     return () => {
       unlockApplication();
-      if (restoreFocusTo?.isConnected) restoreFocusTo.focus();
+      const currentRestoreTarget = getRestoreFocusTargetRef.current?.();
+      if (currentRestoreTarget?.isConnected) currentRestoreTarget.focus();
+      else if (restoreFocusTo?.isConnected) restoreFocusTo.focus();
     };
   }, [initialFocusRef]);
 

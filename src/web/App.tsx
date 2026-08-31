@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { BrowserRouter, NavLink, Navigate, Route, Routes } from 'react-router-dom';
 import { Activity, AlertTriangle, Database, Gauge, ListChecks, PanelLeft, Settings, Users, X } from 'lucide-react';
-import type { WorkflowId } from '../shared/contracts';
+import type { JobRequest, RecoveryEntrySummary, RecoveryResponse, WorkflowId } from '../shared/contracts';
 import { api } from './api';
 import { type ComposerState, ErrorState, JobComposer, StatusPill } from './components';
 import { useJobEvents } from './hooks';
@@ -19,6 +19,7 @@ const NAVIGATION = [
 ];
 
 const MOBILE_NAV_QUERY = '(max-width: 768px)';
+const JOB_DRAWER_QUERY = '(max-width: 1100px)';
 
 export function App() {
   useJobEvents();
@@ -26,7 +27,8 @@ export function App() {
   const [composer, setComposer] = useState<ComposerState | null>(null);
   const [mobileNav, setMobileNav] = useState(false);
   const [focusMessage, setFocusMessage] = useState<string | null>(null);
-  const [isMobile, setIsMobile] = useState(() => typeof window !== 'undefined' && typeof window.matchMedia === 'function' && window.matchMedia(MOBILE_NAV_QUERY).matches);
+  const [isMobile, setIsMobile] = useState(() => matchesMedia(MOBILE_NAV_QUERY));
+  const [useJobDrawer, setUseJobDrawer] = useState(() => matchesMedia(JOB_DRAWER_QUERY));
   const firstMobileNavLinkRef = useRef<HTMLAnchorElement>(null);
   const mobileMenuButtonRef = useRef<HTMLButtonElement>(null);
   const mobileNavWasOpen = useRef(false);
@@ -34,21 +36,78 @@ export function App() {
   const workflows = useQuery({ queryKey: ['workflows'], queryFn: api.workflows });
   const settings = useQuery({ queryKey: ['settings'], queryFn: api.settings });
   const jobs = useQuery({ queryKey: ['jobs'], queryFn: api.jobs, refetchInterval: 10_000 });
+  const recovery = useQuery({ queryKey: ['recovery'], queryFn: api.recovery, refetchInterval: 10_000 });
   const activeJob = useMemo(() => jobs.data?.find((job) => ['running', 'needs_attention', 'cancelling'].includes(job.status)) || null, [jobs.data]);
+  const preparedRecoveries = recovery.data?.entries.filter((entry) => entry.state === 'prepared') || [];
+  const blockingJobs = jobs.data?.filter((job) => ['queued', 'running', 'needs_attention', 'cancelling'].includes(job.status)) || [];
+  const ownsBusyWorkerLock = health.data?.workerLock === 'busy'
+    && Boolean(activeJob)
+    && health.data.activeJobId === activeJob?.id;
+  const jobCreationDisabledReason = jobs.isLoading
+    ? 'Đang kiểm tra trạng thái worker trước khi cho phép tạo job.'
+    : jobs.error
+      ? 'Không thể xác minh trạng thái worker; tạm khóa việc tạo job.'
+      : health.isLoading
+        ? 'Đang kiểm tra automation lock trước khi cho phép tạo job.'
+        : health.error
+          ? 'Không thể xác minh automation lock; tạm khóa việc tạo job.'
+          : health.data?.workerLock !== 'free' && !ownsBusyWorkerLock
+            ? `Automation lock đang ${health.data?.workerLock || 'không xác định'}; chưa thể tạo job.`
+            : recovery.isLoading
+              ? 'Đang kiểm tra recovery journal trước khi cho phép tạo job.'
+              : recovery.error
+                ? 'Không thể xác minh recovery journal; tạm khóa việc tạo job.'
+                : preparedRecoveries.length > 0
+                  ? `Có ${preparedRecoveries.length} recovery chưa xác nhận; xử lý hoặc loại bỏ trước khi tạo job mới.`
+                  : undefined;
+  const recoveryActionDisabledReason = jobs.isLoading
+    ? 'Đang kiểm tra trạng thái job trước khi cho phép xử lý recovery.'
+    : jobs.error
+      ? 'Không thể xác minh trạng thái job; tạm khóa thao tác recovery.'
+      : blockingJobs.length > 0
+        ? 'Chờ job active hoặc queued kết thúc trước khi xử lý recovery.'
+        : health.isLoading
+          ? 'Đang kiểm tra automation lock trước khi cho phép xử lý recovery.'
+          : health.error
+            ? 'Không thể xác minh automation lock; tạm khóa thao tác recovery.'
+            : health.data?.workerLock !== 'free'
+              ? `Automation lock đang ${health.data?.workerLock || 'không xác định'}; chưa thể xử lý recovery.`
+              : undefined;
   const focus = useMutation({
     mutationFn: (jobId: string) => api.focusJob(jobId),
     onMutate: () => setFocusMessage(null),
     onSuccess: (result) => setFocusMessage(result.focused ? null : 'Browser không còn hoạt động để đưa ra trước.'),
     onError: (error) => setFocusMessage(error instanceof Error ? error.message : 'Không thể mở cửa sổ CAPTCHA.'),
   });
+  const refreshRecoveryData = (response: RecoveryResponse) => {
+    queryClient.setQueryData(['recovery'], response);
+    for (const queryKey of [['recovery'], ['health'], ['accounts'], ['account'], ['settings']] as const) {
+      void queryClient.invalidateQueries({ queryKey });
+    }
+  };
+  const syncRecovery = useMutation({ mutationFn: api.syncRecovery, onSuccess: refreshRecoveryData });
+  const discardRecovery = useMutation({ mutationFn: api.discardRecovery, onSuccess: refreshRecoveryData });
+  const activeRecoveryAction = syncRecovery.isPending && syncRecovery.variables
+    ? { entryId: syncRecovery.variables, action: 'sync' as const }
+    : discardRecovery.isPending && discardRecovery.variables
+      ? { entryId: discardRecovery.variables, action: 'discard' as const }
+      : null;
 
   useEffect(() => {
     if (typeof window.matchMedia !== 'function') return;
-    const mediaQuery = window.matchMedia(MOBILE_NAV_QUERY);
-    const updateViewport = () => setIsMobile(mediaQuery.matches);
+    const mobileQuery = window.matchMedia(MOBILE_NAV_QUERY);
+    const drawerQuery = window.matchMedia(JOB_DRAWER_QUERY);
+    const updateViewport = () => {
+      setIsMobile(mobileQuery.matches);
+      setUseJobDrawer(drawerQuery.matches);
+    };
     updateViewport();
-    mediaQuery.addEventListener('change', updateViewport);
-    return () => mediaQuery.removeEventListener('change', updateViewport);
+    mobileQuery.addEventListener('change', updateViewport);
+    drawerQuery.addEventListener('change', updateViewport);
+    return () => {
+      mobileQuery.removeEventListener('change', updateViewport);
+      drawerQuery.removeEventListener('change', updateViewport);
+    };
   }, []);
 
   useEffect(() => {
@@ -73,7 +132,17 @@ export function App() {
 
   useEffect(() => setFocusMessage(null), [activeJob?.id, activeJob?.status]);
 
-  const openComposer = (workflowId: WorkflowId, rowIndexes?: number[]) => setComposer({ workflowId, rowIndexes });
+  const openComposer = (
+    workflowId: WorkflowId,
+    selection: JobRequest['selection'] = { mode: 'allEligible' },
+  ) => {
+    if (jobCreationDisabledReason) return;
+    setComposer({ workflowId, selection });
+  };
+  const confirmDiscard = (entry: RecoveryEntrySummary) => {
+    const confirmed = window.confirm(`Loại bỏ recovery cho ${entry.email}? Hành động này không thể hoàn tác.`);
+    if (confirmed) discardRecovery.mutate(entry.id);
+  };
 
   return (
     <BrowserRouter>
@@ -90,10 +159,7 @@ export function App() {
               </NavLink>
             ))}
           </nav>
-          <div className="sidebar-foot">
-            <span className="signal-dot signal-ready" />
-            <span>127.0.0.1</span>
-          </div>
+          <div className="sidebar-foot"><span className="signal-dot signal-ready" /><span>127.0.0.1</span></div>
         </aside>
 
         <main className="main-shell">
@@ -116,14 +182,28 @@ export function App() {
             </div>
           )}
 
-          {workflows.error && <ErrorState error={workflows.error} />}
+          {(recovery.isLoading || recovery.error || recovery.data?.entries.length) ? (
+            <RecoveryBanner
+              entries={recovery.data?.entries || []}
+              loading={recovery.isLoading}
+              error={recovery.error}
+              activeAction={activeRecoveryAction}
+              actionError={syncRecovery.error || discardRecovery.error}
+              actionDisabledReason={recoveryActionDisabledReason}
+              onSync={(id) => syncRecovery.mutate(id)}
+              onDiscard={confirmDiscard}
+              hidden={isMobile && mobileNav}
+            />
+          ) : null}
+
+          {workflows.error ? <ErrorState error={workflows.error} /> : null}
 
           <div className="page-frame" aria-hidden={isMobile && mobileNav ? true : undefined} inert={isMobile && mobileNav}>
             <Routes>
-              <Route path="/dashboard" element={<DashboardPage onCreateJob={openComposer} />} />
-              <Route path="/accounts" element={<AccountsPage onCreateJob={openComposer} />} />
-              <Route path="/jobs" element={<JobsPage onRetry={(workflowId, rows) => openComposer(workflowId, rows)} />} />
-              <Route path="/settings" element={<SettingsPage onProxyCheck={() => openComposer('proxyCheck')} />} />
+              <Route path="/dashboard" element={<DashboardPage jobCreationDisabledReason={jobCreationDisabledReason} onCreateJob={openComposer} />} />
+              <Route path="/accounts" element={<AccountsPage jobCreationDisabledReason={jobCreationDisabledReason} onCreateJob={openComposer} />} />
+              <Route path="/jobs" element={<JobsPage useDrawer={useJobDrawer} jobCreationDisabledReason={jobCreationDisabledReason} onRetry={openComposer} />} />
+              <Route path="/settings" element={<SettingsPage jobCreationDisabledReason={jobCreationDisabledReason} onProxyCheck={() => openComposer('proxyCheck')} />} />
               <Route path="*" element={<Navigate to="/dashboard" replace />} />
             </Routes>
           </div>
@@ -141,6 +221,7 @@ export function App() {
             settingsError={settings.error}
             settingsLoading={settings.isLoading}
             defaultInterval={settings.data?.values.defaultIntervalMinutes ?? 1}
+            creationDisabledReason={jobCreationDisabledReason}
             onClose={() => setComposer(null)}
             onCreated={() => {
               void queryClient.invalidateQueries({ queryKey: ['jobs'] });
@@ -154,9 +235,45 @@ export function App() {
   );
 }
 
+function RecoveryBanner({ entries, loading, error, activeAction, actionError, actionDisabledReason, onSync, onDiscard, hidden }: {
+  entries: RecoveryEntrySummary[];
+  loading: boolean;
+  error: unknown;
+  activeAction: { entryId: string; action: 'sync' | 'discard' } | null;
+  actionError: unknown;
+  actionDisabledReason?: string;
+  onSync(id: string): void;
+  onDiscard(entry: RecoveryEntrySummary): void;
+  hidden: boolean;
+}) {
+  return (
+    <section className="recovery-banner" role="alert" aria-hidden={hidden || undefined} inert={hidden}>
+      <AlertTriangle size={20} aria-hidden="true" />
+      <div className="recovery-banner-content">
+        <strong>{loading ? 'Đang kiểm tra recovery journal' : error ? 'Không đọc được recovery journal' : `${entries.length} recovery cần xử lý`}</strong>
+        {error ? <ErrorState error={error} /> : entries.map((entry) => (
+          <div className="recovery-entry" key={entry.id}>
+            <span><b>{entry.email}</b><small>{entry.state === 'prepared' ? 'Chưa xác nhận ghi Sheet — đang khóa job mới' : 'Đã xác nhận thao tác — có thể đồng bộ lại Sheet'}</small></span>
+            <div>
+              <button className="button button-primary button-compact" disabled={Boolean(activeAction) || Boolean(actionDisabledReason)} title={actionDisabledReason} onClick={() => onSync(entry.id)}>{activeAction?.entryId === entry.id && activeAction.action === 'sync' ? 'Đang đồng bộ...' : 'Đồng bộ'}</button>
+              <button className="button button-danger-ghost button-compact" disabled={Boolean(activeAction) || Boolean(actionDisabledReason)} title={actionDisabledReason} onClick={() => onDiscard(entry)}>{activeAction?.entryId === entry.id && activeAction.action === 'discard' ? 'Đang loại bỏ...' : 'Loại bỏ'}</button>
+            </div>
+          </div>
+        ))}
+        {actionDisabledReason && entries.length > 0 ? <p className="action-disabled-reason" role="status">{actionDisabledReason}</p> : null}
+        {actionError ? <ErrorState error={actionError} /> : null}
+      </div>
+    </section>
+  );
+}
+
 function HealthItem({ icon: Icon, label, value }: { icon: typeof Activity; label: string; value: string }) {
   const ready = ['ready', 'free'].includes(value);
   const checking = value === 'unchecked';
   const displayValue = checking ? 'Đang kiểm tra' : value;
   return <span className="health-item" aria-label={`${label}: ${displayValue}`} title={`${label}: ${displayValue}`}><Icon size={14} aria-hidden="true" /><i aria-hidden="true" className={`signal-dot ${checking ? 'signal-neutral' : ready ? 'signal-ready' : 'signal-warning'}`} /><b aria-hidden="true">{label}</b><em aria-hidden="true">{displayValue}</em></span>;
+}
+
+function matchesMedia(query: string): boolean {
+  return typeof window !== 'undefined' && typeof window.matchMedia === 'function' && window.matchMedia(query).matches;
 }

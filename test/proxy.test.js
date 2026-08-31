@@ -1,7 +1,9 @@
 const assert = require('assert');
 const http = require('http');
+const net = require('net');
 const {
-  getNewProxy, getNewProxyWithRetry, parseCooldownSeconds, isPermanentProxyError, parseProxyString,
+  fetchViaProxy, getNewProxy, getNewProxyWithRetry, getNewTinProxyWithRetry,
+  parseCooldownSeconds, isPermanentProxyError, parseProxyString,
 } = require('../proxy.js');
 
 // ── parseProxyString: exact fields from the SP07 docs ───────────────────────────────────────
@@ -94,9 +96,30 @@ async function callRetryAgainstLocalServer(port, token, opts) {
   await withServer((req, res) => {
     res.end(JSON.stringify({ status: 'FAILED', message: 'token expired' }));
   }, async (port) => {
-    await assert.rejects(() => callAgainstLocalServer(port, 'tok'), /Proxy API failed.*token expired/);
+    await assert.rejects(() => callAgainstLocalServer(port, 'abc123'), /Proxy API failed.*token expired/);
   });
   console.log('✓ rejects with the API-reported reason on a non-SUCCESS status');
+
+  {
+    const opaqueToken = 'Opaque/SP07+Token?';
+    let providerError;
+    await withServer((req, res) => {
+      res.end(JSON.stringify({
+        status: 'FAILED',
+        message: `provider echo ${opaqueToken} ${encodeURIComponent(opaqueToken)}`,
+      }));
+    }, async (port) => {
+      try {
+        await callAgainstLocalServer(port, opaqueToken);
+      } catch (error) {
+        providerError = error;
+      }
+    });
+    assert.ok(providerError);
+    assert.ok(!providerError.message.includes(opaqueToken));
+    assert.ok(!providerError.message.includes(encodeURIComponent(opaqueToken)));
+  }
+  console.log('✓ SP07 provider echoes cannot expose raw or encoded API keys');
 
   await withServer((req, res) => {
     res.end('<html>not json</html>');
@@ -180,6 +203,105 @@ async function callRetryAgainstLocalServer(port, token, opts) {
     assert.ok(waited < 3000, `must fail fast on a permanent error, took ${waited}ms`);
   }
   console.log('✓ a permanent account error fails after one call instead of burning the retry budget');
+
+  {
+    const originalFetch = global.fetch;
+    const urls = [];
+    global.fetch = async (url) => {
+      urls.push(String(url));
+      return {
+        ok: true,
+        json: async () => ({
+          code: 1,
+          data: {
+            ipv4: '1.2.3.4:5678',
+            credential: { username: 'user', password: 'pass' },
+          },
+        }),
+      };
+    };
+    try {
+      const result = await getNewTinProxyWithRetry('secret-key', { maxAttempts: 1 });
+      assert.strictEqual(result.proxy, '1.2.3.4:5678:user:pass');
+      assert.ok(urls[0].includes('/proxy-fpt/get-new?'));
+      assert.ok(!urls[0].includes('/get-current'));
+    } finally {
+      global.fetch = originalFetch;
+    }
+  }
+  console.log('✓ every TinProxy invocation requests a new proxy rather than reusing current');
+
+  {
+    const originalFetch = global.fetch;
+    const opaqueKey = 'Opaque/TinProxy+Key?';
+    global.fetch = async () => ({
+      ok: true,
+      json: async () => ({
+        code: 0,
+        message: `provider echo ${opaqueKey} ${encodeURIComponent(opaqueKey)}`,
+      }),
+    });
+    try {
+      let providerError;
+      try {
+        await getNewTinProxyWithRetry(opaqueKey, { maxAttempts: 1 });
+      } catch (error) {
+        providerError = error;
+      }
+      assert.ok(providerError);
+      assert.ok(!providerError.message.includes(opaqueKey));
+      assert.ok(!providerError.message.includes(encodeURIComponent(opaqueKey)));
+    } finally {
+      global.fetch = originalFetch;
+    }
+  }
+  console.log('✓ TinProxy provider echoes cannot expose raw or encoded API keys');
+
+  {
+    const originalFetch = global.fetch;
+    let calls = 0;
+    global.fetch = async () => {
+      calls++;
+      return {
+        ok: false,
+        status: 400,
+        json: async () => ({
+          code: 0,
+          message: 'API key không hợp lệ',
+        }),
+      };
+    };
+    try {
+      await assert.rejects(
+        () => getNewTinProxyWithRetry('invalid-key', { maxAttempts: 3 }),
+        /TinProxy HTTP 400: API key không hợp lệ/,
+      );
+      assert.strictEqual(calls, 1, 'a permanent HTTP 400 must fail before GPM startup without fake retries');
+    } finally {
+      global.fetch = originalFetch;
+    }
+  }
+  console.log('✓ TinProxy HTTP errors preserve the provider reason and fail fast when retry cannot help');
+
+  {
+    const sockets = new Set();
+    const server = net.createServer((socket) => sockets.add(socket));
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    try {
+      await assert.rejects(
+        () => fetchViaProxy(
+          'https://example.com/',
+          { server: `http://127.0.0.1:${server.address().port}` },
+          200,
+        ),
+        /timed out after 200ms/,
+      );
+    } finally {
+      for (const socket of sockets) socket.destroy();
+      await new Promise((resolve) => server.close(resolve));
+    }
+  }
+  console.log('✓ proxy tunnel has a bounded end-to-end timeout');
 
   console.log('\nAll assertions passed.');
 })().catch((e) => { console.error('FAILED:', e.message); process.exit(1); });

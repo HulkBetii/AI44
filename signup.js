@@ -1,6 +1,10 @@
 const { chromium } = require('playwright');
 const fs = require('fs');
 const path = require('path');
+const { solveCaptcha } = require('./captcha-solver');
+const { generateSecurePassword } = require('./password-generator');
+const { loadRuntimeConfig } = require('./runtime-config');
+const { collectSecretValues, collectUrlSecrets, redactSecrets } = require('./secret-sanitizer');
 
 const ACCOUNTS_FILE = path.join(__dirname, 'accounts.json');
 const FAILURE_SCREENSHOT = path.join(__dirname, 'debug-failure.png');
@@ -14,6 +18,19 @@ let context = null;
 let activePage = null;
 let currentStep = 'init';
 let account = null;
+let activeAdditionalSecrets = [];
+let apiKeyMayBeVisible = false;
+
+function safeErrorText(error, extra = []) {
+  let runtimeConfig = null;
+  try { runtimeConfig = loadRuntimeConfig(); } catch {}
+  const secrets = collectSecretValues({
+    account,
+    runtimeConfig,
+    extra: [account?.mailboxPassword, account?.mailboxToken, ...activeAdditionalSecrets, ...extra],
+  });
+  return redactSecrets(error?.stack || error?.message || error, secrets);
+}
 
 function step(name) {
   currentStep = name;
@@ -42,7 +59,7 @@ async function createMailTmAccount() {
   const domain = domainsJson['hydra:member'][0].domain;
 
   const username = Math.random().toString(36).slice(2, 10);
-  const password = 'Passw0rd!';
+  const password = generateSecurePassword();
   const address = `${username}@${domain}`;
 
   // Create account
@@ -96,11 +113,7 @@ async function pollMailTmInbox(token, timeoutMs = 120000) {
 }
 
 function generatePassword() {
-  const letters = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ';
-  const numbers = '0123456789';
-  const specials = '!@#$%^&*';
-  const rand = (str) => str[Math.floor(Math.random() * str.length)];
-  return Array.from({ length: 6 }, () => rand(letters)).join('') + rand(numbers) + rand(specials);
+  return generateSecurePassword();
 }
 
 function safePageLocation(page) {
@@ -197,25 +210,49 @@ async function run() {
 
   // Still on the signup page means the submit has not gone through yet.
   if (page.url().includes('sign-up')) {
-    console.log('\n⚠️  Solve the CAPTCHA in the browser window if one is shown.');
-    // Either the URL leaves /sign-up, or a "Resend" button appears (= verification email sent).
-    // Both branches swallow their own timeout so the losing promise cannot reject unhandled
-    // after the race has already settled.
-    const settled = await Promise.race([
-      page.waitForURL(url => !url.toString().includes('/sign-up'), { timeout: SIGNUP_TIMEOUT_MS })
-        .then(() => 'url-changed').catch(() => null),
-      page.waitForSelector('button:has-text("Resend")', { timeout: SIGNUP_TIMEOUT_MS })
-        .then(() => 'resend-shown').catch(() => null),
-    ]);
-    if (!settled) {
-      throw new Error(`Signup did not complete within ${SIGNUP_TIMEOUT_MS}ms (still at ${safePageLocation(page)})`);
+    const autoResult = await solveCaptcha(page).catch((err) => {
+      const safeMessage = safeErrorText(err);
+      console.warn(`[captcha] Auto-solve threw: ${safeMessage}`);
+      return { solved: false, reason: safeMessage };
+    });
+
+    if (autoResult.solved) {
+      console.log(`[4] CAPTCHA auto-solved (${autoResult.solver}: ${autoResult.provider})`);
+      await page.waitForTimeout(1500);
+
+      // If still on signup page, click submit with the injected token
+      if (page.url().includes('sign-up')) {
+        const submitBtn = await page.$('button[style*="view-transition-name: submit"]');
+        if (submitBtn) {
+          console.log('[captcha] Submitting signup form with solved token...');
+          await submitBtn.click().catch(() => {});
+        }
+      }
+      await page.waitForTimeout(3000);
     }
-    console.log(`[4] Signup complete (${settled}). Page: ${safePageLocation(page)}`);
+
+    if (page.url().includes('sign-up')) {
+      if (!autoResult.solved) {
+        console.log(`[captcha] Auto-solve skipped: ${autoResult.reason}`);
+      }
+      console.log('\n⚠️  Solve the CAPTCHA in the browser window if one is shown.');
+      const settled = await Promise.race([
+        page.waitForURL(url => !url.toString().includes('/sign-up'), { timeout: SIGNUP_TIMEOUT_MS })
+          .then(() => 'url-changed').catch(() => null),
+        page.waitForSelector('button:has-text("Resend")', { timeout: SIGNUP_TIMEOUT_MS })
+          .then(() => 'resend-shown').catch(() => null),
+      ]);
+      if (!settled) {
+        throw new Error(`Signup did not complete within ${SIGNUP_TIMEOUT_MS}ms (still at ${safePageLocation(page)})`);
+      }
+      console.log(`[4] Signup complete (${settled}). Page: ${safePageLocation(page)}`);
+    }
   }
 
   // ── STEP 5: Poll mail.tm for verify email ──────────────────────────────────
   step('5/10 poll mail.tm for verification email');
   const verifyUrl = await pollMailTmInbox(mailToken, INBOX_TIMEOUT_MS);
+  activeAdditionalSecrets.push(...collectUrlSecrets(verifyUrl));
   console.log('[5] Verify URL found securely.');
 
   // ── STEP 6: Open verify URL ─────────────────────────────────────────────────
@@ -300,6 +337,7 @@ async function run() {
   // page-level one, so scope by dialog: the button's only id is React's generated
   // data-agent-id, which changes on every render.
   console.log('[10] Submitting Create API Key dialog...');
+  apiKeyMayBeVisible = true;
   await verifyPage
     .getByRole('dialog')
     .getByRole('button', { name: 'Create Key', exact: true })
@@ -349,7 +387,7 @@ async function run() {
 
 async function captureFailure(err) {
   console.error(`\n❌ FAILED at step: ${currentStep}`);
-  console.error(err.stack || err.message);
+  console.error(safeErrorText(err));
 
   // The mailbox and ElevenLabs account already exist at this point, so persist them even
   // though the run failed. Losing them means the CAPTCHA was solved for nothing.
@@ -361,15 +399,23 @@ async function captureFailure(err) {
     console.error('[debug] No live page to inspect.');
     return;
   }
+  if (apiKeyMayBeVisible || account?.apiKey) {
+    console.error('[debug] Screenshot skipped because the page may contain a captured API key.');
+    return;
+  }
   // Page state at the moment of failure is the only thing that explains a selector timeout.
   try {
     console.error(`[debug] Page: ${safePageLocation(activePage)}`);
     const text = await activePage.evaluate(() => document.body.innerText.slice(0, 800));
-    console.error(`[debug] Visible text:\n${text}`);
-    await activePage.screenshot({ path: FAILURE_SCREENSHOT, fullPage: true });
+    console.error(`[debug] Visible text:\n${safeErrorText(text)}`);
+    await activePage.screenshot({
+      path: FAILURE_SCREENSHOT,
+      fullPage: true,
+      mask: [activePage.locator('input[type="password"]')],
+    });
     console.error(`[debug] Screenshot: ${FAILURE_SCREENSHOT}`);
   } catch (captureErr) {
-    console.error(`[debug] Capture failed: ${captureErr.message}`);
+    console.error(`[debug] Capture failed: ${safeErrorText(captureErr)}`);
   }
 }
 
@@ -381,6 +427,6 @@ run()
   .finally(async () => {
     // Always release the persistent profile, otherwise the next run hits a profile lock.
     if (context) {
-      await context.close().catch((err) => console.error(`[cleanup] ${err.message}`));
+      await context.close().catch((err) => console.error(`[cleanup] ${safeErrorText(err)}`));
     }
   });

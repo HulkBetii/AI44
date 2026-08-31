@@ -13,7 +13,7 @@
 // 'need to recover password' is a dead Hotmail login that will fail the same way forever.
 // Without a way to name rows, rescuing the first meant re-queueing the second as well.
 
-const { initSheets, loadRows, resetRows } = require('./sheets');
+const { initSheets, loadRows, resetRows, resolveUniqueRowsByEmail } = require('./sheets');
 const { withAutomationLock } = require('./automation-lock');
 
 function parseArgs(argv) {
@@ -103,6 +103,21 @@ function selectRows(all, { rows = null, statuses = null, force = false } = {}) {
   };
 }
 
+function assertResetCandidatesUnchanged(selected, current) {
+  if (selected.length !== current.length) {
+    throw new Error('Sheet reset scope changed since preview');
+  }
+  return current.map((row, index) => {
+    const original = selected[index];
+    if (row.status !== original.status
+      || row.apiKey !== original.apiKey
+      || row.elevenPass !== original.elevenPass) {
+      throw new Error(`Sheet account ${original.email} changed since preview; refusing reset`);
+    }
+    return row;
+  });
+}
+
 async function main() {
   const { apply, force, rows, statuses } = parseArgs(process.argv.slice(2));
 
@@ -153,15 +168,19 @@ async function main() {
     return;
   }
 
-  await resetRows(candidates.map((r) => r.rowIndex));
-  console.log(`\n✅ Reset ${candidates.length} row(s) to 'pending': ${candidates.map((r) => r.rowIndex).join(', ')}`);
+  const currentCandidates = assertResetCandidatesUnchanged(
+    candidates,
+    await resolveUniqueRowsByEmail(candidates.map((candidate) => candidate.email)),
+  );
+  await resetRows(currentCandidates.map((candidate) => candidate.rowIndex));
+  console.log(`\n✅ Reset ${currentCandidates.length} row(s) to 'pending': ${currentCandidates.map((candidate) => candidate.rowIndex).join(', ')}`);
 }
 
 if (require.main === module) {
   withAutomationLock('reset-rows-cli', main).catch((err) => {
-    console.error('❌ Failed:', err.stack || err.message);
+    console.error('❌ Failed:', err instanceof Error ? err.message : String(err));
     process.exitCode = 1;
   });
 }
 
-module.exports = { parseArgs, selectRows };
+module.exports = { assertResetCandidatesUnchanged, parseArgs, selectRows };

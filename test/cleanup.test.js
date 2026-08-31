@@ -16,11 +16,15 @@ const path = require('path');
 // Extracted rather than required: signup-hotmail.js calls run() at import time.
 const src = fs.readFileSync(path.join(__dirname, '..', 'signup-hotmail.js'), 'utf8');
 
-const releaseSrc = src.match(/let releasing = null;\nfunction releaseProfile\(\) \{[\s\S]*?\n\}/);
+const releaseSrc = src.match(/let releasing = null;\r?\nfunction releaseProfile\(\) \{[\s\S]*?\n\}/);
 assert.ok(releaseSrc, 'releaseProfile not found in signup-hotmail.js');
 
-const signalSrc = src.match(/let shuttingDown = false;\nfor \(const sig of \['SIGINT', 'SIGTERM'\]\) \{[\s\S]*?\n\}/);
+const signalSrc = src.match(/function installCliSignalHandlers\(targetProcess = process\) \{[\s\S]*?\n\}/);
 assert.ok(signalSrc, 'the SIGINT/SIGTERM handler is missing from signup-hotmail.js');
+assert.ok(
+  src.indexOf('installCliSignalHandlers();') > src.indexOf('if (require.main === module)'),
+  'CLI signal handlers must not be installed when automation-worker imports signup-hotmail',
+);
 
 // gpmProfileId must live at module scope. If it is re-declared inside the loop the handler
 // reads a different binding and silently cleans up nothing - the original bug, which looks
@@ -30,7 +34,7 @@ assert.ok(
   'gpmProfileId must be declared at module scope',
 );
 assert.ok(
-  !/^\s+let gpmProfileId\b/m.test(src),
+  !/^[ \t]+let gpmProfileId\b/m.test(src),
   'gpmProfileId must not be re-declared inside the account loop',
 );
 console.log('✓ gpmProfileId is module-scope, visible to every exit path');
@@ -53,7 +57,9 @@ function build({ onStop, onDelete } = {}) {
     let activePage = null;
     let browser = null;
     let gpmProfileId = null;
+    let profileCreateInFlight = null;
     function step() {}
+    function safeErrorText(error) { return error?.message || String(error); }
     ${releaseSrc[0]}
     return {
       releaseProfile,
@@ -61,6 +67,7 @@ function build({ onStop, onDelete } = {}) {
       getProfile: () => gpmProfileId,
       setBrowser: (b) => { browser = b; },
       getBrowser: () => browser,
+      setCreatePromise: (promise) => { profileCreateInFlight = promise; },
     };
   `);
   // The real sleep between stop and delete is 2s of dead time; the ordering under test does
@@ -83,6 +90,24 @@ function build({ onStop, onDelete } = {}) {
     assert.strictEqual(h.getProfile(), null);
     assert.strictEqual(h.getBrowser(), null);
     console.log('✓ stops, then deletes, then clears the handles');
+  }
+
+  // Cancellation during /create must wait for the remote outcome, then clean up the late id.
+  {
+    const h = build();
+    let resolveCreate;
+    h.setCreatePromise(new Promise((resolve) => { resolveCreate = resolve; }));
+    let settled = false;
+    const release = h.releaseProfile().then(() => { settled = true; });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.strictEqual(settled, false);
+    resolveCreate('created-after-cancel');
+    await release;
+    assert.deepStrictEqual(h.events, [
+      'stop:created-after-cancel',
+      'delete:created-after-cancel',
+    ]);
+    console.log('✓ cancellation waits for an in-flight GPM create and deletes the late profile');
   }
 
   // The Ctrl+C race. The signal handler calls process.exit as soon as its releaseProfile
@@ -170,13 +195,15 @@ function build({ onStop, onDelete } = {}) {
     };
     const quiet = { log() {}, warn() {}, error() {} };
     const install = new Function('process', 'console', 'releaseProfile', 'gpmProfileId', `
+      function safeErrorText(error) { return error?.message || String(error); }
       ${signalSrc[0]}
+      return installCliSignalHandlers;
     `);
     const releaseProfile = async () => {
       await new Promise((r) => setImmediate(r));
       order.push('release');
     };
-    install(fakeProcess, quiet, releaseProfile, null);
+    install(fakeProcess, quiet, releaseProfile, null)(fakeProcess);
 
     assert.deepStrictEqual(Object.keys(handlers).sort(), ['SIGINT', 'SIGTERM'],
       'both signals must be handled - npm and CI send SIGTERM, the operator sends SIGINT');

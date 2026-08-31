@@ -12,11 +12,16 @@ export const WorkflowIdSchema = z.enum([
 
 export type WorkflowId = z.infer<typeof WorkflowIdSchema>;
 
-export const ProxyModeSchema = z.enum(['sheet', 'none', 'override']);
-export type ProxyMode = z.infer<typeof ProxyModeSchema>;
+export const AccountIdentitySchema = z.object({
+  rowIndex: z.number().int().min(2),
+  email: z.string().trim().min(1),
+}).strict();
+
+export type AccountIdentity = z.infer<typeof AccountIdentitySchema>;
 
 export const AccountSelectionSchema = z.discriminatedUnion('mode', [
   z.object({ mode: z.literal('rows'), rowIndexes: z.array(z.number().int().min(2)).min(1) }),
+  z.object({ mode: z.literal('identities'), accounts: z.array(AccountIdentitySchema).min(1) }),
   z.object({ mode: z.literal('allEligible') }),
 ]);
 
@@ -26,14 +31,10 @@ const JobSelectionSchema = z.object({
 });
 
 const JobOptionsSchema = z.object({
-  proxyMode: ProxyModeSchema,
-  proxyTokenOverride: z.string().trim().min(1).optional(),
   intervalMinutes: z.number().positive().max(180),
 }).strict();
 
 const JobPreviewOptionsSchema = z.object({
-  proxyMode: ProxyModeSchema,
-  hasProxyTokenOverride: z.boolean(),
   intervalMinutes: z.number().positive().max(180),
 }).strict();
 
@@ -41,32 +42,9 @@ function validateWorkflowRequest(
   request: {
     workflowId: WorkflowId;
     selection: z.infer<typeof AccountSelectionSchema>;
-    options: { proxyMode: ProxyMode; hasProxyTokenOverride: boolean };
   },
   context: z.RefinementCtx,
-  overridePath: 'proxyTokenOverride' | 'hasProxyTokenOverride',
 ): void {
-  if (request.options.proxyMode === 'override' && !request.options.hasProxyTokenOverride) {
-    context.addIssue({
-      code: 'custom',
-      path: ['options', overridePath],
-      message: 'A proxy token is required when proxyMode is override',
-    });
-  }
-  if (request.options.proxyMode !== 'override' && request.options.hasProxyTokenOverride) {
-    context.addIssue({
-      code: 'custom',
-      path: ['options', overridePath],
-      message: 'A proxy token override is only allowed when proxyMode is override',
-    });
-  }
-  if (request.workflowId === 'proxyCheck' && request.options.proxyMode === 'none') {
-    context.addIssue({
-      code: 'custom',
-      path: ['options', 'proxyMode'],
-      message: 'proxyCheck requires a Sheet or override proxy token',
-    });
-  }
   if (request.workflowId === 'proxyCheck' && request.selection.mode !== 'allEligible') {
     context.addIssue({
       code: 'custom',
@@ -78,19 +56,11 @@ function validateWorkflowRequest(
 
 export const JobRequestSchema = JobSelectionSchema.extend({
   options: JobOptionsSchema,
-}).superRefine((request, context) => {
-  validateWorkflowRequest({
-    ...request,
-    options: {
-      proxyMode: request.options.proxyMode,
-      hasProxyTokenOverride: Boolean(request.options.proxyTokenOverride),
-    },
-  }, context, 'proxyTokenOverride');
-});
+}).superRefine((request, context) => validateWorkflowRequest(request, context));
 
 export const JobPreviewRequestSchema = JobSelectionSchema.extend({
   options: JobPreviewOptionsSchema,
-}).superRefine((request, context) => validateWorkflowRequest(request, context, 'hasProxyTokenOverride'));
+}).superRefine((request, context) => validateWorkflowRequest(request, context));
 
 export type JobPreviewRequest = z.infer<typeof JobPreviewRequestSchema>;
 
@@ -146,6 +116,7 @@ export interface AccountRuntime {
   state: 'queued' | 'running' | 'waiting_captcha' | 'cancelling';
   jobId: string;
   workflowId: WorkflowId;
+  currentStep: string | null;
 }
 
 export interface AccountSummary {
@@ -157,7 +128,6 @@ export interface AccountSummary {
   eligibleWorkflows: WorkflowId[];
   hasElevenPassword: boolean;
   hasApiKey: boolean;
-  hasProxyToken: boolean;
   lastRunAt: string | null;
   runtime: AccountRuntime | null;
 }
@@ -181,7 +151,6 @@ export interface WorkflowDefinition {
   description: string;
   risk: 'normal' | 'attention' | 'danger';
   supportsAccountSelection: boolean;
-  allowedProxyModes: ProxyMode[];
   usesInterval: boolean;
 }
 
@@ -211,6 +180,7 @@ export interface JobRecord {
   status: JobStatus;
   request: PublicJobRequest;
   acceptedRows: number[];
+  acceptedAccounts?: AccountIdentity[];
   rejectedCount: number;
   createdAt: string;
   startedAt: string | null;
@@ -230,6 +200,7 @@ export interface HealthResponse {
   workerLock: 'free' | 'busy' | 'stale';
   activeJobId: string | null;
   queueLength: number;
+  recoveryPendingCount: number;
 }
 
 export interface RuntimeSettings {
@@ -239,10 +210,46 @@ export interface RuntimeSettings {
   gpmApiBase: string;
   defaultIntervalMinutes: number;
   runtimeDirectory: string;
+  proxyProvider: 'tinproxy' | 'sp07' | 'none';
+  proxyApiKey?: string;
+  capsolverApiKey?: string;
+  capbypassApiKey?: string;
+  twoCaptchaApiKey?: string;
+  nonecapApiKey?: string;
+}
+
+export const SECRET_SETTING_KEYS = [
+  'proxyApiKey',
+  'capsolverApiKey',
+  'capbypassApiKey',
+  'twoCaptchaApiKey',
+  'nonecapApiKey',
+] as const;
+
+export type SecretSettingKey = typeof SECRET_SETTING_KEYS[number];
+export type PublicRuntimeSettings = Omit<RuntimeSettings, SecretSettingKey>;
+
+export interface SettingsUpdateRequest extends PublicRuntimeSettings {
+  secrets?: Partial<Record<SecretSettingKey, string | null>>;
 }
 
 export interface SettingsResponse {
-  values: RuntimeSettings;
+  values: PublicRuntimeSettings;
+  configuredSecrets: SecretSettingKey[];
   envOverrides: Array<keyof RuntimeSettings>;
   canEdit: boolean;
+}
+
+export interface RecoveryEntrySummary {
+  id: string;
+  state: 'prepared' | 'confirmed';
+  email: string;
+  originalRowIndex: number | null;
+  operation: 'signup' | 'resetPassword';
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface RecoveryResponse {
+  entries: RecoveryEntrySummary[];
 }

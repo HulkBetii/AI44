@@ -1,66 +1,68 @@
-// Runs a signup pass and then the recovery passes, in the order their failure modes chain:
-// a row stranded after signup is picked up by --resume; one whose stored password no longer
-// opens the account needs --reset-password first, and --resume again afterwards.
-//
-// Which flag a row needs is fully determined by its sheet state, so there is nothing here a
-// person has to decide - this just saves reading the sheet between passes.
-//
-//   node batch.js --limit=10
-//
-// Arguments are passed to the first pass only. The recovery passes deliberately take every
-// stranded row, not just the ones this batch created.
-
-const { spawn } = require('child_process');
-const path = require('path');
 const { withAutomationLock } = require('./automation-lock');
+const sheets = require('./sheets');
+const { runFullCycle } = require('./automation-worker');
+const { parseArgs: parseSignupArgs } = require('./signup-hotmail');
+const { isEligibleForWorkflow } = require('./workflow-policy');
 
-const SCRIPT = path.join(__dirname, 'signup-hotmail.js');
+function normalizeEmail(value) {
+  return String(value || '').trim().toLowerCase();
+}
 
-const firstPassArgs = process.argv.slice(2);
-const PASSES = [
-  { name: 'signup', args: firstPassArgs },
-  { name: 'resume stranded rows', args: ['--resume'] },
-  { name: 'reset rejected passwords', args: ['--reset-password'] },
-  { name: 'resume after reset', args: ['--resume'] },
-];
+function parseBatchArgs(argv) {
+  const parsed = parseSignupArgs(argv);
+  if (parsed.resume || parsed.resetPassword || parsed.regenerateKey || parsed.auditWeakPasswords
+    || parsed.rows || parsed.expectedEmail) {
+    throw new Error('batch.js accepts only --row, --limit, --interval, and --no-proxy');
+  }
+  return {
+    row: parsed.row,
+    limit: parsed.limit,
+    intervalMinutes: parsed.interval,
+    noProxy: parsed.noProxy,
+  };
+}
 
-function run(args) {
-  return new Promise((resolve) => {
-    const child = spawn(process.execPath, [SCRIPT, ...args], {
-      cwd: __dirname,
-      stdio: 'inherit',
-      env: { ...process.env, MAIL_TEMP_LOCK_HELD: '1' },
-    });
-    child.on('close', resolve);
-    child.on('error', (err) => {
-      console.error(`[batch] could not start pass: ${err.message}`);
-      resolve(1);
-    });
+function selectBatchAccounts(rows, { row, limit }) {
+  const emailCounts = new Map();
+  for (const account of rows) {
+    const email = normalizeEmail(account.email);
+    emailCounts.set(email, (emailCounts.get(email) || 0) + 1);
+  }
+
+  const selected = rows
+    .filter((account) => row === null || account.rowIndex === row)
+    .filter((account) => isEligibleForWorkflow(account, 'fullCycle'));
+  const limited = Number.isFinite(limit) ? selected.slice(0, limit) : selected;
+  return limited.map((account) => {
+    const email = normalizeEmail(account.email);
+    if (!email || emailCounts.get(email) !== 1) {
+      throw new Error(`Batch scope requires one unique Sheet row for ${account.email || '(blank email)'}`);
+    }
+    return { rowIndex: account.rowIndex, email: account.email };
   });
 }
 
-withAutomationLock('batch-cli', async () => {
-  for (const [i, pass] of PASSES.entries()) {
-    console.log(`\n${'━'.repeat(64)}`);
-    console.log(`▶ pass ${i + 1}/${PASSES.length}: ${pass.name}`);
-    const displayArgs = pass.args.map((arg) => arg.startsWith('--proxy-token=')
-      ? '--proxy-token=[REDACTED]'
-      : arg);
-    console.log(`  node signup-hotmail.js ${displayArgs.join(' ')}`.trimEnd());
-    console.log('━'.repeat(64));
-
-    // Per-account failures are handled inside the script and leave it exiting 0, so a
-    // non-zero code here means something fatal - carrying on would only repeat it.
-    const code = await run(pass.args);
-    if (code !== 0) {
-      console.error(`\n✖ pass "${pass.name}" exited with code ${code}. Stopping.`);
-      process.exitCode = code;
-      return;
-    }
+async function main(argv = process.argv.slice(2)) {
+  const options = parseBatchArgs(argv);
+  await sheets.initSheets();
+  const accounts = selectBatchAccounts(await sheets.loadRows(), options);
+  if (accounts.length === 0) {
+    throw new Error('Batch scope contains no full-cycle eligible accounts');
   }
-  console.log(`\n${'━'.repeat(64)}`);
-  console.log('✅ All passes finished. Check the sheet for any row still not complete.');
-}).catch((err) => {
-  console.error(`[batch] ${err.message}`);
-  process.exitCode = 1;
-});
+  console.log(`Running full cycle for ${accounts.length} scoped account(s).`);
+  await runFullCycle(accounts, {
+    options: {
+      intervalMinutes: options.intervalMinutes,
+      noProxy: options.noProxy,
+    },
+  });
+}
+
+if (require.main === module) {
+  withAutomationLock('batch-cli', () => main()).catch((error) => {
+    console.error(`[batch] ${error.message}`);
+    process.exitCode = 1;
+  });
+}
+
+module.exports = { main, parseBatchArgs, selectBatchAccounts };

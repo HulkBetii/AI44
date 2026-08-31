@@ -21,16 +21,18 @@ function mailbox(bodies, renderDelayMs = 0) {
   return `<!doctype html><html><body style="margin:0;font-family:sans-serif">
     <div id="list"></div><div id="pane"></div>
     <script>
-      const bodies = ${JSON.stringify(bodies)};
+      const bodies = ${JSON.stringify(bodies)}.map((entry) =>
+        typeof entry === 'string' ? { html: entry, receivedAt: null } : entry);
       const list = document.getElementById('list');
       // Outlook fetches and renders its message list well after domcontentloaded.
       setTimeout(() => {
-      bodies.forEach((html, i) => {
+      bodies.forEach((entry, i) => {
         const row = document.createElement('div');
         row.setAttribute('role', 'option');
+        if (entry.receivedAt) row.setAttribute('data-received-at', entry.receivedAt);
         row.textContent = 'ElevenLabs message ' + i;
         row.style.padding = '8px';
-        row.addEventListener('click', () => { document.getElementById('pane').innerHTML = html; });
+        row.addEventListener('click', () => { document.getElementById('pane').innerHTML = entry.html; });
         list.appendChild(row);
       });
       }, ${renderDelayMs});
@@ -57,6 +59,43 @@ async function serveMailbox(page, bodies, seen, renderDelayMs = 0) {
     const reset = await pollOutlookInbox(page, 20000, 'resetPassword');
     assert.strictEqual(reset, 'https://elevenlabs.io/app/action?mode=resetPassword&oobCode=NEWRESET');
     console.log('✓ picks the reset link past a stale verification mail');
+    await page.close();
+  }
+
+  // Two matching reset links can coexist. The request timestamp must exclude the stale one,
+  // even when Outlook renders it first.
+  {
+    const page = await browser.newPage({ viewport: { width: 900, height: 600 } });
+    const requestedAt = Date.parse('2026-08-24T10:00:00.000Z');
+    await serveMailbox(page, [
+      {
+        html: '<a href="https://elevenlabs.io/app/action?mode=resetPassword&amp;oobCode=OLDRESET">Reset</a>',
+        receivedAt: '2026-08-24T09:59:00.000Z',
+      },
+      {
+        html: '<a href="https://elevenlabs.io/app/action?mode=resetPassword&amp;oobCode=FRESHRESET">Reset</a>',
+        receivedAt: '2026-08-24T10:00:05.000Z',
+      },
+    ]);
+    const reset = await pollOutlookInbox(page, 20000, 'resetPassword', requestedAt);
+    assert.strictEqual(reset, 'https://elevenlabs.io/app/action?mode=resetPassword&oobCode=FRESHRESET');
+    console.log('✓ ignores a matching stale link older than the reset request');
+    await page.close();
+  }
+
+  // Live Outlook rows often expose only a localized time such as "10:22 PM", which cannot
+  // be compared safely with the request timestamp. The visible candidate must still be
+  // opened and checked instead of being skipped forever while Inbox and Junk alternate.
+  {
+    const page = await browser.newPage({ viewport: { width: 900, height: 600 } });
+    const requestedAt = Date.parse('2026-08-24T10:00:00.000Z');
+    await serveMailbox(page, [{
+      html: '<a href="https://elevenlabs.io/app/action?mode=resetPassword&amp;oobCode=VISIBLE_RESET">Reset</a>',
+      receivedAt: null,
+    }]);
+    const reset = await pollOutlookInbox(page, 20000, 'resetPassword', requestedAt);
+    assert.strictEqual(reset, 'https://elevenlabs.io/app/action?mode=resetPassword&oobCode=VISIBLE_RESET');
+    console.log('✓ opens a visible reset email when Outlook omits a machine-readable timestamp');
     await page.close();
   }
 

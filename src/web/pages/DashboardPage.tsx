@@ -5,7 +5,7 @@ import type { WorkflowId } from '../../shared/contracts';
 import { api } from '../api';
 import { EmptyState, ErrorState, LoadingLine, StatusPill } from '../components';
 
-export function DashboardPage({ onCreateJob }: { onCreateJob(workflowId: WorkflowId): void }) {
+export function DashboardPage({ jobCreationDisabledReason, onCreateJob }: { jobCreationDisabledReason?: string; onCreateJob(workflowId: WorkflowId): void }) {
   const queryClient = useQueryClient();
   const accounts = useQuery({ queryKey: ['accounts'], queryFn: () => api.accounts() });
   const jobs = useQuery({ queryKey: ['jobs'], queryFn: api.jobs, refetchInterval: 8_000 });
@@ -23,6 +23,11 @@ export function DashboardPage({ onCreateJob }: { onCreateJob(workflowId: Workflo
   const active = jobs.data?.find((job) => ['running', 'needs_attention', 'cancelling'].includes(job.status));
   const queued = jobs.data?.filter((job) => job.status === 'queued') || [];
   const history = jobs.data?.filter((job) => !['queued', 'running', 'needs_attention', 'cancelling'].includes(job.status)).slice(0, 5) || [];
+  const createDisabledReason = jobs.isLoading
+    ? 'Đang kiểm tra trạng thái worker.'
+    : jobs.error
+      ? 'Không thể đọc trạng thái worker; tạm khóa thao tác tạo job.'
+      : jobCreationDisabledReason;
 
   return (
     <div className="page-stack page-enter">
@@ -33,10 +38,10 @@ export function DashboardPage({ onCreateJob }: { onCreateJob(workflowId: Workflo
 
       <section className={`active-run ${active?.status === 'needs_attention' ? 'active-run-attention' : ''}`}>
         <div className="active-run-head">
-          <div><span className="eyebrow">Active job</span><h2>{active ? workflowName(active.request.workflowId) : 'Worker đang rảnh'}</h2></div>
-          {active ? <StatusPill status={active.status} /> : <span className="status-pill status-idle">idle</span>}
+          <div><span className="eyebrow">Active job</span><h2>{jobs.isLoading ? 'Đang kiểm tra worker' : jobs.error ? 'Không đọc được worker' : active ? workflowName(active.request.workflowId) : 'Worker đang rảnh'}</h2></div>
+          {active ? <StatusPill status={active.status} /> : !jobs.isLoading && !jobs.error ? <span className="status-pill status-idle">idle</span> : null}
         </div>
-        {active ? (
+        {jobs.isLoading ? <LoadingLine label="Đang kiểm tra trạng thái worker" /> : jobs.error ? <ErrorState error={jobs.error} /> : active ? (
           <>
             <div className="run-grid">
               <div><span>Account</span><strong>{active.currentAccount} / {active.totalAccounts || '—'}</strong><small>{active.currentRowIndex ? `Sheet row ${active.currentRowIndex}` : 'Đang khởi tạo'}</small></div>
@@ -55,11 +60,14 @@ export function DashboardPage({ onCreateJob }: { onCreateJob(workflowId: Workflo
         )}
       </section>
 
-      <section className="quick-actions" aria-label="Thao tác nhanh">
-        <button onClick={() => onCreateJob('signup')}><span><Play size={18} /></span><strong>Chạy pending</strong><small>Signup các dòng đang chờ</small><ArrowRight size={17} /></button>
-        <button onClick={() => onCreateJob('fullCycle')}><span><RotateCcw size={18} /></span><strong>Chạy full cycle</strong><small>Tự xử lý các recovery pass</small><ArrowRight size={17} /></button>
-        <button onClick={() => onCreateJob('proxyCheck')}><span><RadioTower size={18} /></span><strong>Kiểm tra proxy</strong><small>Exit IP và host bắt buộc</small><ArrowRight size={17} /></button>
-      </section>
+      <div>
+        <section className="quick-actions" aria-label="Thao tác nhanh">
+          <button disabled={Boolean(createDisabledReason)} title={createDisabledReason} onClick={() => onCreateJob('signup')}><span><Play size={18} /></span><strong>Chạy pending</strong><small>Signup các dòng đang chờ</small><ArrowRight size={17} /></button>
+          <button disabled={Boolean(createDisabledReason)} title={createDisabledReason} onClick={() => onCreateJob('fullCycle')}><span><RotateCcw size={18} /></span><strong>Chạy full cycle</strong><small>Tự xử lý các recovery pass</small><ArrowRight size={17} /></button>
+          <button disabled={Boolean(createDisabledReason)} title={createDisabledReason} onClick={() => onCreateJob('proxyCheck')}><span><RadioTower size={18} /></span><strong>Kiểm tra proxy</strong><small>Exit IP và host bắt buộc</small><ArrowRight size={17} /></button>
+        </section>
+        {createDisabledReason && <p className="action-disabled-reason" role="status">{createDisabledReason}</p>}
+      </div>
 
       {accounts.isLoading ? <LoadingLine /> : accounts.error ? <ErrorState error={accounts.error} /> : (
         <section className="stat-strip">
@@ -74,11 +82,11 @@ export function DashboardPage({ onCreateJob }: { onCreateJob(workflowId: Workflo
       <div className="dashboard-columns">
         <section className="section-block">
           <div className="section-heading"><div><span className="eyebrow">Queue</span><h2>Sắp chạy</h2></div><span className="count-label">{queued.length}</span></div>
-          {queued.length ? queued.map((job, index) => <div className="queue-row" key={job.id}><span className="queue-index">{String(index + 1).padStart(2, '0')}</span><div><strong>{workflowName(job.request.workflowId)}</strong><small>{job.totalAccounts || 'diagnostic'} account · {relativeTime(job.createdAt)}</small></div><StatusPill status={job.status} /></div>) : <EmptyState title="Hàng đợi trống">Job mới có thể bắt đầu ngay.</EmptyState>}
+          {jobs.isLoading ? <LoadingLine /> : jobs.error ? <ErrorState error={jobs.error} /> : queued.length ? queued.map((job, index) => <div className="queue-row" key={job.id}><span className="queue-index">{String(index + 1).padStart(2, '0')}</span><div><strong>{workflowName(job.request.workflowId)}</strong><small>{job.totalAccounts || 'diagnostic'} account · {relativeTime(job.createdAt)}</small></div><StatusPill status={job.status} /></div>) : <EmptyState title="Hàng đợi trống">Job mới có thể bắt đầu ngay.</EmptyState>}
         </section>
         <section className="section-block">
           <div className="section-heading"><div><span className="eyebrow">Recent</span><h2>Vừa hoàn thành</h2></div></div>
-          {jobs.isLoading ? <LoadingLine /> : history.length ? history.map((job) => <div className="history-row" key={job.id}><div><strong>{workflowName(job.request.workflowId)}</strong><small>{relativeTime(job.completedAt || job.createdAt)} · {job.errorCount} lỗi</small></div><StatusPill status={job.status} /></div>) : <EmptyState title="Chưa có lịch sử">Lượt chạy sẽ xuất hiện tại đây.</EmptyState>}
+          {jobs.isLoading ? <LoadingLine /> : jobs.error ? <ErrorState error={jobs.error} /> : history.length ? history.map((job) => <div className="history-row" key={job.id}><div><strong>{workflowName(job.request.workflowId)}</strong><small>{relativeTime(job.completedAt || job.createdAt)} · {job.errorCount} lỗi</small></div><StatusPill status={job.status} /></div>) : <EmptyState title="Chưa có lịch sử">Lượt chạy sẽ xuất hiện tại đây.</EmptyState>}
         </section>
       </div>
     </div>
@@ -103,7 +111,6 @@ export function relativeTime(value: string): string {
 
 async function focusJob(jobId: string) {
   const result = await api.focusJob(jobId);
-  const focused = 'focused' in result ? result.focused : 'accepted' in result ? result.accepted : true;
-  if (!focused) throw new Error('Browser không còn hoạt động để đưa ra trước');
+  if (!result.focused) throw new Error('Browser không còn hoạt động để đưa ra trước');
   return result;
 }

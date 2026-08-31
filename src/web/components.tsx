@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { AlertTriangle, Check, Copy, Eye, EyeOff, LoaderCircle, X } from 'lucide-react';
-import type { JobPreview, JobPreviewRequest, JobRequest, ProxyMode, WorkflowDefinition, WorkflowId } from '../shared/contracts';
+import type { JobPreview, JobPreviewRequest, JobRequest, WorkflowDefinition, WorkflowId } from '../shared/contracts';
 import { api } from './api';
 import { Overlay } from './Overlay';
 
@@ -37,7 +37,7 @@ export function LoadingLine({ label = 'Đang tải dữ liệu' }: { label?: str
 
 export interface ComposerState {
   workflowId: WorkflowId;
-  rowIndexes?: number[];
+  selection?: JobRequest['selection'];
 }
 
 export function JobComposer({
@@ -47,6 +47,7 @@ export function JobComposer({
   settingsError,
   settingsLoading,
   defaultInterval,
+  creationDisabledReason,
   onClose,
   onCreated,
 }: {
@@ -56,48 +57,49 @@ export function JobComposer({
   settingsError?: unknown;
   settingsLoading: boolean;
   defaultInterval: number;
+  creationDisabledReason?: string;
   onClose(): void;
   onCreated(): void;
 }) {
   const queryClient = useQueryClient();
-  const [proxyMode, setProxyMode] = useState<JobRequest['options']['proxyMode']>('sheet');
-  const [proxyToken, setProxyToken] = useState('');
   const [intervalMinutes, setIntervalMinutes] = useState(defaultInterval);
   const [creating, setCreating] = useState(false);
   const [createError, setCreateError] = useState<unknown>(null);
   const creatingRef = useRef(false);
+  const abortControllerRef = useRef<AbortController | null>(null);
+  const mountedRef = useRef(true);
   const intervalEditedRef = useRef(false);
   const definition = workflows.find((workflow) => workflow.id === state.workflowId);
-  const allowedProxyModes = definition?.allowedProxyModes || ['sheet', 'none', 'override'];
-  const validProxyMode = allowedProxyModes.includes(proxyMode);
   const intervalSettingsReady = !definition?.usesInterval || (!settingsLoading && !settingsError);
-  const selection = useMemo<JobRequest['selection']>(() => state.rowIndexes?.length
-    ? { mode: 'rows', rowIndexes: state.rowIndexes }
-    : { mode: 'allEligible' }, [state.rowIndexes]);
+  const selection = useMemo<JobRequest['selection']>(
+    () => state.selection || { mode: 'allEligible' },
+    [state.selection],
+  );
   const previewRequest = useMemo<JobPreviewRequest>(() => ({
     workflowId: state.workflowId,
     selection,
     options: {
-      proxyMode,
-      hasProxyTokenOverride: proxyMode === 'override' && Boolean(proxyToken.trim()),
       intervalMinutes,
     },
-  }), [state.workflowId, selection, proxyMode, proxyToken, intervalMinutes]);
+  }), [state.workflowId, selection, intervalMinutes]);
 
   const preview = useQuery({
     queryKey: ['job-preview', previewRequest],
     queryFn: () => api.previewJob(previewRequest),
-    enabled: Boolean(definition) && intervalSettingsReady && validProxyMode && (proxyMode !== 'override' || Boolean(proxyToken.trim())),
+    enabled: Boolean(definition) && intervalSettingsReady,
     retry: false,
   });
+  const invalidateOperationalData = () => {
+    for (const queryKey of [['jobs'], ['health'], ['accounts'], ['settings']] as const) {
+      void queryClient.invalidateQueries({ queryKey });
+    }
+  };
   const createJob = async () => {
-    if (creatingRef.current || !definition || !intervalSettingsReady || !validProxyMode) return;
+    if (creatingRef.current || !definition || !intervalSettingsReady || creationDisabledReason) return;
     const request: JobRequest = {
       workflowId: state.workflowId,
       selection,
       options: {
-        proxyMode,
-        ...(proxyMode === 'override' ? { proxyTokenOverride: proxyToken.trim() } : {}),
         intervalMinutes,
       },
     };
@@ -105,45 +107,53 @@ export function JobComposer({
     creatingRef.current = true;
     setCreating(true);
     setCreateError(null);
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
     try {
-      await api.createJob(request);
-      void queryClient.invalidateQueries({ queryKey: ['jobs'] });
-      void queryClient.invalidateQueries({ queryKey: ['health'] });
-      void queryClient.invalidateQueries({ queryKey: ['accounts'] });
-      void queryClient.invalidateQueries({ queryKey: ['settings'] });
+      await api.createJob(request, controller.signal);
+      if (controller.signal.aborted) return;
       onCreated();
       onClose();
     } catch (error) {
-      setCreateError(error);
+      if (!isAbortError(error) && mountedRef.current) setCreateError(error);
     } finally {
+      invalidateOperationalData();
       creatingRef.current = false;
-      setCreating(false);
+      if (abortControllerRef.current === controller) abortControllerRef.current = null;
+      if (mountedRef.current) setCreating(false);
     }
   };
 
   const isDiagnostic = state.workflowId === 'proxyCheck';
   const acceptedCount = preview.data?.accepted.length || 0;
-  const validOverride = proxyMode !== 'override' || Boolean(proxyToken.trim());
   const canCreate = Boolean(
     definition
     && intervalSettingsReady
-    && validProxyMode
-    && validOverride
     && preview.data
     && !preview.error
     && !preview.isFetching
     && !creating
+    && !creationDisabledReason
     && (isDiagnostic || acceptedCount > 0),
   );
-  const close = () => { if (!creating) onClose(); };
-  const changeProxyMode = (mode: ProxyMode) => {
-    setProxyMode(mode);
-    if (mode !== 'override') setProxyToken('');
+  const close = () => {
+    if (creatingRef.current) {
+      abortControllerRef.current?.abort();
+      invalidateOperationalData();
+    }
+    onClose();
   };
 
   useEffect(() => {
     if (!intervalEditedRef.current) setIntervalMinutes(defaultInterval);
   }, [defaultInterval]);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      abortControllerRef.current?.abort();
+    };
+  }, []);
 
   return (
     <Overlay backdropClassName="modal-backdrop" panelClassName="modal" labelledBy="composer-title" onClose={close}>
@@ -153,48 +163,40 @@ export function JobComposer({
             <h2 id="composer-title">{definition?.label || state.workflowId}</h2>
             <p>{definition?.description}</p>
           </div>
-          <button className="icon-button" disabled={creating} onClick={close} aria-label="Đóng"><X size={18} /></button>
+          <button className="icon-button" onClick={close} aria-label={creating ? 'Dừng chờ và đóng' : 'Đóng'}><X size={18} /></button>
         </header>
 
         <div className="modal-body">
           {workflowError ? <ErrorState error={workflowError} /> : !definition ? <LoadingLine label="Đang tải workflow registry" /> : definition.usesInterval && settingsError ? <ErrorState error={settingsError} /> : definition.usesInterval && settingsLoading ? <LoadingLine label="Đang tải interval mặc định" /> : <>
           <div className="form-grid">
-            <label>
-              <span>Chế độ proxy</span>
-              <select value={proxyMode} onChange={(event) => changeProxyMode(event.target.value as ProxyMode)}>
-                {allowedProxyModes.includes('sheet') && <option value="sheet">Token từ Google Sheet</option>}
-                {allowedProxyModes.includes('none') && <option value="none">Không dùng proxy</option>}
-                {allowedProxyModes.includes('override') && <option value="override">Override tạm thời</option>}
-              </select>
-            </label>
             {definition?.usesInterval && <label>
               <span>Interval trung bình (phút)</span>
               <input type="number" min="0.1" max="180" step="0.1" value={intervalMinutes} onChange={(event) => { intervalEditedRef.current = true; setIntervalMinutes(Number(event.target.value)); }} />
             </label>}
           </div>
-          {proxyMode === 'override' && (
-            <label className="field-block">
-              <span>Proxy token override</span>
-              <input type="password" autoComplete="off" value={proxyToken} onChange={(event) => setProxyToken(event.target.value)} placeholder="Không lưu vào log hoặc lịch sử" />
-            </label>
-          )}
 
           <PreviewPanel preview={preview.data} loading={preview.isFetching} error={preview.error} workflowId={state.workflowId} />
           {definition?.risk !== 'normal' && (
             <div className="warning-box"><AlertTriangle size={17} />Workflow này thay đổi credential hoặc trạng thái account. Backend sẽ kiểm tra eligibility lại trước khi chạy.</div>
           )}
           </>}
-          {createError && <ErrorState error={createError} />}
+          {creationDisabledReason ? <div className="warning-box" role="status">{creationDisabledReason}</div> : null}
+          {creating ? <div className="warning-box" role="status">Có thể đóng cửa sổ để dừng chờ. Việc này không hủy request trên server; hãy kiểm tra trang Lượt chạy trước khi thử lại.</div> : null}
+          {createError ? <ErrorState error={createError} /> : null}
         </div>
 
         <footer className="modal-footer">
-          <button className="button button-ghost" disabled={creating} onClick={close}>Hủy</button>
+          <button className="button button-ghost" onClick={close}>{creating ? 'Dừng chờ và đóng' : 'Hủy'}</button>
           <button className="button button-primary" disabled={!canCreate} onClick={() => void createJob()}>
             {creating ? 'Đang thêm...' : `Thêm vào hàng đợi${acceptedCount ? ` · ${acceptedCount}` : ''}`}
           </button>
         </footer>
     </Overlay>
   );
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof Error && error.name === 'AbortError';
 }
 
 function PreviewPanel({ preview, loading, error, workflowId }: { preview?: JobPreview; loading: boolean; error: unknown; workflowId: WorkflowId }) {
@@ -229,19 +231,58 @@ function phaseLabel(phaseId: string, workflowId: WorkflowId): string {
   } as Record<string, string>)[phaseId] || workflowId;
 }
 
-export function SecretValue({ rowIndex, field, label, present }: { rowIndex: number; field: string; label: string; present: boolean }) {
+export function SecretValue({ rowIndex, expectedEmail, field, label, present }: { rowIndex: number; expectedEmail: string; field: string; label: string; present: boolean }) {
   const [value, setValue] = useState<string | null>(null);
   const [revealing, setRevealing] = useState(false);
   const [revealError, setRevealError] = useState<string | null>(null);
+  const [copyState, setCopyState] = useState<'idle' | 'copying' | 'copied'>('idle');
+  const [copyError, setCopyError] = useState<string | null>(null);
+  const copyTimerRef = useRef<number | null>(null);
+  const identity = `${rowIndex}\0${expectedEmail.trim().toLowerCase()}\0${field}`;
+  const identityRef = useRef(identity);
+  identityRef.current = identity;
 
   useEffect(() => {
+    if (copyTimerRef.current !== null) window.clearTimeout(copyTimerRef.current);
+    setValue(null);
+    setRevealError(null);
+    setRevealing(false);
+    setCopyState('idle');
+    setCopyError(null);
+  }, [identity]);
+
+  useEffect(() => {
+    if (copyTimerRef.current !== null) window.clearTimeout(copyTimerRef.current);
+    copyTimerRef.current = null;
+    setCopyState('idle');
+    setCopyError(null);
     if (value === null) return;
     const timer = setTimeout(() => setValue(null), 30_000);
     return () => clearTimeout(timer);
   }, [value]);
 
+  useEffect(() => () => {
+    if (copyTimerRef.current !== null) window.clearTimeout(copyTimerRef.current);
+  }, []);
+
   const copy = async () => {
-    if (value !== null) await navigator.clipboard.writeText(value);
+    if (value === null || copyState === 'copying') return;
+    const requestedIdentity = identity;
+    setCopyState('copying');
+    setCopyError(null);
+    try {
+      await navigator.clipboard.writeText(value);
+      if (identityRef.current !== requestedIdentity) return;
+      setCopyState('copied');
+      if (copyTimerRef.current !== null) window.clearTimeout(copyTimerRef.current);
+      copyTimerRef.current = window.setTimeout(() => {
+        if (identityRef.current === requestedIdentity) setCopyState('idle');
+      }, 2_000);
+    } catch (error) {
+      if (identityRef.current !== requestedIdentity) return;
+      setCopyState('idle');
+      setCopyError(error instanceof Error ? error.message : 'Không thể copy credential');
+    }
   };
   const toggleReveal = async () => {
     if (value !== null) {
@@ -250,13 +291,16 @@ export function SecretValue({ rowIndex, field, label, present }: { rowIndex: num
     }
     setRevealing(true);
     setRevealError(null);
+    const requestedIdentity = identity;
     try {
-      const response = await api.revealSecret(rowIndex, field);
+      const response = await api.revealSecret(rowIndex, field, expectedEmail);
+      if (identityRef.current !== requestedIdentity) return;
       setValue(response.value);
     } catch (error) {
+      if (identityRef.current !== requestedIdentity) return;
       setRevealError(error instanceof Error ? error.message : 'Không thể reveal secret');
     } finally {
-      setRevealing(false);
+      if (identityRef.current === requestedIdentity) setRevealing(false);
     }
   };
 
@@ -268,8 +312,10 @@ export function SecretValue({ rowIndex, field, label, present }: { rowIndex: num
         <button className="icon-button" disabled={revealing || (!present && value === null)} onClick={() => void toggleReveal()} aria-label={`${value !== null ? 'Ẩn' : 'Hiện'} ${label}`}>
           {value !== null ? <EyeOff size={16} /> : revealing ? <LoaderCircle className="spin" size={16} /> : <Eye size={16} />}
         </button>
-        <button className="icon-button" disabled={value === null} onClick={copy} aria-label={`Copy ${label}`}><Copy size={16} /></button>
+        <button className="icon-button" disabled={value === null || copyState === 'copying'} onClick={() => void copy()} aria-label={`${copyState === 'copying' ? 'Đang copy' : copyState === 'copied' ? 'Đã copy' : 'Copy'} ${label}`}>{copyState === 'copying' ? <LoaderCircle className="spin" size={16} /> : copyState === 'copied' ? <Check size={16} /> : <Copy size={16} />}</button>
       </div>
+      {copyState === 'copied' && <small className="secret-feedback" role="status">Đã copy</small>}
+      {copyError && <small className="secret-error" role="alert">{copyError}</small>}
       {revealError && <small className="secret-error" role="alert">{revealError}</small>}
     </div>
   );

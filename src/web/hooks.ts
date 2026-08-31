@@ -55,14 +55,15 @@ export function useJobEvents(): void {
     const invalidate = (event: JobEvent, defer: boolean) => {
       if (event.type === 'log') return;
 
-      const changesRuntime = ['job.state', 'attention.required', 'attention.cleared'].includes(event.type);
+      const changesRuntimeState = ['job.state', 'attention.required', 'attention.cleared'].includes(event.type);
+      const changesRuntimeDisplay = changesRuntimeState || ['step.changed', 'phase.started'].includes(event.type);
       const changesAccount = ['account.succeeded', 'account.failed'].includes(event.type);
 
       const targets = {
         jobs: true,
-        health: changesRuntime,
-        accounts: changesRuntime || changesAccount,
-        accountDetails: changesRuntime || changesAccount,
+        health: changesRuntimeState,
+        accounts: changesRuntimeDisplay || changesAccount,
+        accountDetails: changesRuntimeDisplay || changesAccount,
         jobDetails: true,
         settings: event.type === 'job.state',
       };

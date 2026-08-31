@@ -1,12 +1,15 @@
 const { chromium } = require('playwright');
+const { generateSecurePassword } = require('./password-generator');
+const { collectSecretValues, redactSecrets } = require('./secret-sanitizer');
+
+let debugSecrets = [];
+
+function safeDebugText(value) {
+  return redactSecrets(value?.stack || value?.message || value, debugSecrets);
+}
 
 function generatePassword() {
-  const letters = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ';
-  const numbers = '0123456789';
-  const specials = '!@#$%^&*';
-  const rand = (str) => str[Math.floor(Math.random() * str.length)];
-  const base = Array.from({ length: 6 }, () => rand(letters)).join('');
-  return base + rand(numbers) + rand(specials);
+  return generateSecurePassword();
 }
 
 (async () => {
@@ -24,6 +27,7 @@ function generatePassword() {
   );
   const email = await mailPage.$eval('#mail', el => el.value);
   const password = generatePassword();
+  debugSecrets = collectSecretValues({ extra: [password] });
   console.log(`[1] Email: ${email}`);
   console.log('[1] Password generated securely.');
 
@@ -37,6 +41,7 @@ function generatePassword() {
     // Try cookie
     return document.cookie;
   });
+  debugSecrets = collectSecretValues({ extra: [password, token] });
   console.log('[1] Auth token/cookie captured securely.');
 
   // ── STEP 2: Sign up on ElevenLabs ──────────────────────────────────────────
@@ -45,7 +50,9 @@ function generatePassword() {
   await signupPage.goto('https://elevenlabs.io/app/sign-up', { waitUntil: 'networkidle' });
 
   // Capture any console errors
-  signupPage.on('console', msg => { if (msg.type() === 'error') console.log('[2 console error]', msg.text()); });
+  signupPage.on('console', (message) => {
+    if (message.type() === 'error') console.log('[2 console error]', safeDebugText(message.text()));
+  });
 
   await signupPage.waitForSelector('[data-testid="sign-up-email-input"]', { timeout: 15000 });
 
@@ -62,13 +69,16 @@ function generatePassword() {
   console.log('[2] Button disabled after fill:', btnDisabledAfter);
 
   // Take screenshot before clicking
-  await signupPage.screenshot({ path: 'debug-before-signup.png' });
+  await signupPage.screenshot({
+    path: 'debug-before-signup.png',
+    mask: [signupPage.locator('input[type="password"]')],
+  });
 
   if (btnDisabledAfter) {
     console.log('[2] Button still disabled! Checking password requirements...');
     // Check validation messages
     const msgs = await signupPage.$$eval('[class*="error"], [class*="invalid"], [class*="hint"]', els => els.map(e => e.textContent.trim()));
-    console.log('[2] Validation messages:', msgs);
+    console.log('[2] Validation messages:', msgs.map(safeDebugText));
   }
 
   await signupPage.click('button[style*="view-transition-name: submit"]', { force: true });
@@ -76,12 +86,15 @@ function generatePassword() {
 
   // Wait and take screenshot after click
   await signupPage.waitForTimeout(5000);
-  await signupPage.screenshot({ path: 'debug-after-signup.png' });
+  await signupPage.screenshot({
+    path: 'debug-after-signup.png',
+    mask: [signupPage.locator('input[type="password"]')],
+  });
   console.log('[2] Signup response page loaded.');
 
   // Check for error messages on page
   const pageText = await signupPage.evaluate(() => document.body.innerText.substring(0, 500));
-  console.log('[2] Page text after signup:', pageText);
+  console.log('[2] Page text after signup:', safeDebugText(pageText));
 
   // ── STEP 3: Poll temp-mail API directly ────────────────────────────────────
   console.log('[3] Polling temp-mail inbox via API...');
@@ -106,9 +119,9 @@ function generatePassword() {
         });
         return res.status + ' ' + (await res.text()).substring(0, 200);
       }, emailForApi);
-      console.log('[3] API response:', apiResult);
+      console.log('[3] API response:', safeDebugText(apiResult));
     } catch(e) {
-      console.log('[3] API error:', e.message);
+      console.log('[3] API error:', safeDebugText(e));
     }
 
     // Also check DOM

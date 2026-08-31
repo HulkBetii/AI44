@@ -5,5 +5,6 @@ export default defineConfig({
     include: ['src/**/*.test.ts', 'src/**/*.test.tsx'],
     environmentMatchGlobs: [['src/web/**', 'jsdom']],
     setupFiles: ['src/web/test-setup.ts'],
+    fileParallelism: false,
   },
 });

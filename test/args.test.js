@@ -6,17 +6,40 @@ const path = require('path');
 const src = fs.readFileSync(path.join(__dirname, '..', 'signup-hotmail.js'), 'utf8');
 const fn = src.match(/function parseArgs\(argv\) \{[\s\S]*?\n\}/)[0];
 const parseArgs = new Function(`${fn}; return parseArgs;`)();
+const identityFn = src.match(/function assertSafeAccountIdentities\(selectedRows, allRows = selectedRows\) \{[\s\S]*?\n\}/)[0];
+const assertSafeAccountIdentities = new Function(`${identityFn}; return assertSafeAccountIdentities;`)();
+const defaults = {
+  limit: Infinity, row: null, rows: null, resume: false, resetPassword: false,
+  regenerateKey: false, noProxy: false, interval: 1, expectedEmail: null,
+  auditWeakPasswords: false,
+};
 
-assert.deepStrictEqual(parseArgs([]), { limit: Infinity, row: null, rows: null, resume: false, resetPassword: false, regenerateKey: false, noProxy: false, proxyToken: null, interval: 1 });
+assert.deepStrictEqual(parseArgs([]), defaults);
 console.log('✓ no flags → process everything');
 
-assert.deepStrictEqual(parseArgs(['--limit=2']), { limit: 2, row: null, rows: null, resume: false, resetPassword: false, regenerateKey: false, noProxy: false, proxyToken: null, interval: 1 });
+assert.throws(
+  () => assertSafeAccountIdentities([{ rowIndex: 2, email: '' }]),
+  /no email identity/,
+);
+assert.throws(
+  () => assertSafeAccountIdentities(
+    [{ rowIndex: 2, email: 'duplicate@example.com' }],
+    [
+      { rowIndex: 2, email: 'duplicate@example.com' },
+      { rowIndex: 8, email: 'DUPLICATE@example.com' },
+    ],
+  ),
+  /not unique/,
+);
+console.log('✓ blank and duplicate Sheet identities fail before browser automation starts');
+
+assert.deepStrictEqual(parseArgs(['--limit=2']), { ...defaults, limit: 2 });
 console.log('✓ --limit=2 parsed');
 
-assert.deepStrictEqual(parseArgs(['--row=7']), { limit: Infinity, row: 7, rows: null, resume: false, resetPassword: false, regenerateKey: false, noProxy: false, proxyToken: null, interval: 1 });
+assert.deepStrictEqual(parseArgs(['--row=7']), { ...defaults, row: 7 });
 console.log('✓ --row=7 parsed');
 
-assert.deepStrictEqual(parseArgs(['--row=7', '--limit=1']), { limit: 1, row: 7, rows: null, resume: false, resetPassword: false, regenerateKey: false, noProxy: false, proxyToken: null, interval: 1 });
+assert.deepStrictEqual(parseArgs(['--row=7', '--limit=1']), { ...defaults, limit: 1, row: 7 });
 console.log('✓ flags combine');
 
 for (const bad of ['--limit=0', '--limit=-3', '--limit=abc', '--limit=1.5']) {
@@ -30,11 +53,11 @@ for (const bad of ['--row=1', '--row=0', '--row=xyz']) {
 console.log('✓ invalid --row rejected (header row, zero, non-numeric)');
 
 assert.deepStrictEqual(parseArgs(['--regenerate-key', '--rows=2,5,6']), {
-  limit: Infinity, row: null, rows: [2, 5, 6], resume: false, resetPassword: false, regenerateKey: true, noProxy: false, proxyToken: null, interval: 1,
+  ...defaults, rows: [2, 5, 6], regenerateKey: true,
 });
 console.log('✓ --regenerate-key with --rows parsed');
 
-assert.deepStrictEqual(parseArgs(['--rows= 2 , 5 ']).rows, [2, 5]);
+assert.deepStrictEqual(parseArgs(['--regenerate-key', '--rows= 2 , 5 ']).rows, [2, 5]);
 console.log('✓ --rows tolerates spaces');
 
 // Re-keying without naming rows would silently do nothing, so it must be rejected.
@@ -50,18 +73,6 @@ assert.strictEqual(parseArgs(['--no-proxy']).noProxy, true);
 assert.strictEqual(parseArgs([]).noProxy, false);
 console.log('✓ --no-proxy parsed');
 
-assert.strictEqual(parseArgs(['--proxy-token=abc123']).proxyToken, 'abc123');
-assert.strictEqual(parseArgs([]).proxyToken, null);
-console.log('✓ --proxy-token parsed');
-
-// Asking to both skip the proxy and use a specific one is a contradiction; silently
-// honouring one would make a diagnostic run lie about what it tested.
-assert.throws(
-  () => parseArgs(['--no-proxy', '--proxy-token=abc123']),
-  /mutually exclusive/,
-);
-console.log('✓ --no-proxy and --proxy-token together are rejected');
-
 assert.strictEqual(parseArgs(['--interval=5']).interval, 5);
 assert.strictEqual(parseArgs(['--interval=0.5']).interval, 0.5);
 console.log('✓ --interval parsed (fractional minutes allowed)');
@@ -72,5 +83,26 @@ for (const bad of ['--interval=0', '--interval=-2', '--interval=abc', '--interva
   assert.throws(() => parseArgs([bad]), /--interval must be/, `should reject ${bad}`);
 }
 console.log('✓ invalid --interval rejected (zero, negative, non-numeric, empty)');
+
+assert.deepStrictEqual(parseArgs(['--expected-email=User@Example.com', '--row=7']), {
+  ...defaults, row: 7, expectedEmail: 'User@Example.com',
+});
+assert.throws(() => parseArgs(['--expected-email=user@example.com']), /requires exactly one/);
+console.log('✓ internal expected-email requires one stable row target');
+
+assert.deepStrictEqual(parseArgs(['--audit-weak-passwords']), {
+  ...defaults, auditWeakPasswords: true,
+});
+assert.throws(() => parseArgs(['--audit-weak-passwords', '--row=7']), /cannot be combined/);
+console.log('✓ weak-password audit is a standalone read-only mode');
+
+assert.throws(() => parseArgs(['--reset']), /Use --reset-password instead/);
+for (const bad of ['--proxy-token=secret', 'row=7']) {
+  assert.throws(() => parseArgs([bad]), /Unknown option/);
+}
+assert.throws(() => parseArgs(['--resume', '--reset-password']), /mutually exclusive/);
+assert.throws(() => parseArgs(['--row=7', '--row=8']), /only be provided once/);
+assert.throws(() => parseArgs(['--rows=2']), /only valid with --regenerate-key/);
+console.log('✓ unknown, conflicting and duplicate options are rejected');
 
 console.log('\nAll assertions passed.');

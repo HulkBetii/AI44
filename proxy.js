@@ -1,6 +1,9 @@
 const https = require('https');
+const { collectSecretValues, redactSecrets } = require('./secret-sanitizer');
 
 function getNewProxy(token, timeoutMs = 15000) {
+  const secrets = collectSecretValues({ extra: [token] });
+  const safe = (value) => redactSecrets(value, secrets);
   return new Promise((resolve, reject) => {
     const url = `https://proxy.mkvn.net/sp07api/get_new?token=${encodeURIComponent(token)}`;
 
@@ -14,9 +17,7 @@ function getNewProxy(token, timeoutMs = 15000) {
             resolve(json);
           } else {
             const reason = json.message || json.error || 'Unknown proxy API error';
-            const safeReason = token.length >= 8
-              ? String(reason).split(token).join('[REDACTED]')
-              : String(reason);
+            const safeReason = safe(reason);
             reject(new Error(`Proxy API failed with status: ${json.status} - Reason: ${safeReason}`));
           }
         } catch (e) {
@@ -24,7 +25,7 @@ function getNewProxy(token, timeoutMs = 15000) {
         }
       });
     }).on('error', (e) => {
-      reject(new Error(`Failed to call proxy API: ${e.message}`));
+      reject(new Error(`Failed to call proxy API: ${safe(e.message)}`));
     });
 
     // https.get has no default timeout: an unresponsive server hangs this forever, freezing
@@ -69,20 +70,23 @@ async function getNewProxyWithRetry(token, {
   fallbackDelayMs = 20000,
   timeoutMs = 15000,
 } = {}) {
+  const secrets = collectSecretValues({ extra: [token] });
+  const safe = (value) => redactSecrets(value, secrets);
   let lastErr;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
       return await getNewProxy(token, timeoutMs);
     } catch (err) {
-      lastErr = err;
-      if (isPermanentProxyError(err.message)) {
+      const safeMessage = safe(err.message);
+      lastErr = new Error(safeMessage);
+      if (isPermanentProxyError(safeMessage)) {
         console.log(`[proxy] Not retrying - this is an account/token problem, not a transient one.`);
         break;
       }
       if (attempt === maxAttempts) break;
-      const cooldownSec = parseCooldownSeconds(err.message);
+      const cooldownSec = parseCooldownSeconds(safeMessage);
       const waitMs = cooldownSec != null ? (cooldownSec + 2) * 1000 : fallbackDelayMs;
-      console.log(`[proxy] Attempt ${attempt}/${maxAttempts} failed (${err.message}); retrying in ${Math.round(waitMs / 1000)}s...`);
+      console.log(`[proxy] Attempt ${attempt}/${maxAttempts} failed (${safeMessage}); retrying in ${Math.round(waitMs / 1000)}s...`);
       await new Promise((resolve) => setTimeout(resolve, waitMs));
     }
   }
@@ -123,10 +127,21 @@ function fetchViaProxy(targetUrl, proxy, timeoutMs = 10000) {
     const proxyPort = Number(proxyUrl.port) || 80;
 
     const socket = net.connect(proxyPort, proxyUrl.hostname);
+    let tlsSocket = null;
+    let settled = false;
     const timer = setTimeout(() => {
-      socket.destroy(new Error(`Proxy connection timed out after ${timeoutMs}ms`));
+      const error = new Error(`Proxy request timed out after ${timeoutMs}ms`);
+      if (tlsSocket) tlsSocket.destroy(error);
+      else socket.destroy(error);
     }, timeoutMs);
-    const fail = (err) => { clearTimeout(timer); reject(err); };
+    const finish = (error, body) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (error) reject(error);
+      else resolve(body);
+    };
+    const fail = (error) => finish(error);
 
     socket.once('error', fail);
     socket.once('connect', () => {
@@ -143,16 +158,15 @@ function fetchViaProxy(targetUrl, proxy, timeoutMs = 10000) {
       buf += chunk.toString('latin1');
       if (!buf.includes('\r\n\r\n')) return;
       socket.removeListener('data', onConnectResponse);
-      clearTimeout(timer);
 
       const statusLine = buf.split('\r\n')[0];
       if (!/^HTTP\/1\.[01] 200/.test(statusLine)) {
         socket.destroy();
-        return reject(new Error(`Proxy CONNECT failed: ${statusLine}`));
+        return fail(new Error(`Proxy CONNECT failed: ${statusLine}`));
       }
 
       // The tunnel is open; upgrade the raw socket to TLS for the actual HTTPS request.
-      const tlsSocket = tls.connect({ socket, servername: target.hostname }, () => {
+      tlsSocket = tls.connect({ socket, servername: target.hostname }, () => {
         tlsSocket.write(
           `GET ${target.pathname}${target.search} HTTP/1.1\r\nHost: ${target.hostname}\r\nConnection: close\r\n\r\n`,
         );
@@ -161,12 +175,99 @@ function fetchViaProxy(targetUrl, proxy, timeoutMs = 10000) {
       tlsSocket.on('data', (d) => { response += d.toString(); });
       tlsSocket.on('end', () => {
         const body = response.split('\r\n\r\n').slice(1).join('\r\n\r\n');
-        resolve(body);
+        finish(null, body);
       });
-      tlsSocket.on('error', reject);
+      tlsSocket.on('error', fail);
     }
     socket.on('data', onConnectResponse);
   });
+}
+
+// --------------- TinProxy residential FPT ---------------
+
+const TINPROXY_API_BASE = 'https://api.tinproxy.com';
+
+// Parse TinProxy FPT response into { proxy: "host:port:user:pass", nextChangeIP, publicIp }
+function parseTinProxyData(data) {
+  if (!data || !data.ipv4) throw new Error('TinProxy: missing ipv4 in response');
+  const [host, port] = data.ipv4.split(':');
+  const user = data.credential?.username;
+  const pass = data.credential?.password;
+  if (!host || !port || !user || !pass) {
+    throw new Error(`TinProxy: incomplete proxy data (${data.ipv4})`);
+  }
+  return {
+    proxy: `${host}:${port}:${user}:${pass}`,
+    nextChangeIP: data.nextChangeIP || 0,
+    publicIp: data.public_ipv4 || 'unknown',
+  };
+}
+
+async function tinproxyFetch(endpoint, secrets = []) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 15000);
+  try {
+    const res = await fetch(`${TINPROXY_API_BASE}${endpoint}`, { signal: controller.signal });
+    let json;
+    try {
+      json = await res.json();
+    } catch {
+      throw new Error(res.ok ? 'TinProxy returned invalid JSON' : `TinProxy HTTP ${res.status}`);
+    }
+    if (!res.ok) {
+      const reason = json?.message || json?.error;
+      throw new Error(`TinProxy HTTP ${res.status}${reason ? `: ${reason}` : ''}`);
+    }
+    if (json.code !== 1) {
+      const reason = json.message || `code ${json.code || 'unknown'}`;
+      throw new Error(`TinProxy API error: ${redactSecrets(reason, secrets)}`);
+    }
+    return json.data;
+  } catch (error) {
+    throw new Error(redactSecrets(error.message, secrets));
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function getNewTinProxy(apiKey) {
+  const secrets = collectSecretValues({ extra: [apiKey] });
+  const data = await tinproxyFetch(`/proxy-fpt/get-new?key=${encodeURIComponent(apiKey)}`, secrets);
+  const result = parseTinProxyData(data);
+  console.log(`[proxy] TinProxy new: IP ${result.publicIp} (${data.ipv4}), next change in ${result.nextChangeIP}s`);
+  return result;
+}
+
+// Cooldown-aware retry: if the API says "wait N seconds", sleep and retry.
+async function getNewTinProxyWithRetry(apiKey, { maxAttempts = 3 } = {}) {
+  const secrets = collectSecretValues({ extra: [apiKey] });
+  const safe = (value) => redactSecrets(value, secrets);
+  let lastErr;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await getNewTinProxy(apiKey);
+    } catch (err) {
+      // Extract a localized cooldown duration when the provider includes one.
+      const safeMessage = safe(err.message);
+      lastErr = new Error(safeMessage);
+      const cooldownMatch = /(?:còn|đợi|wait)?\s*(\d+)\s*(?:s|gi[aâ]y|seconds?)/i.exec(safeMessage);
+      const waitSec = cooldownMatch ? Number(cooldownMatch[1]) + 2 : null;
+      const permanentHttpError = /^TinProxy HTTP 4\d\d\b/.test(safeMessage)
+        && !/^TinProxy HTTP 429\b/.test(safeMessage)
+        && waitSec == null;
+
+      if (attempt === maxAttempts || permanentHttpError) break;
+
+      if (waitSec) {
+        console.log(`[proxy] TinProxy cooldown: waiting ${waitSec}s before retry ${attempt + 1}/${maxAttempts}...`);
+        await new Promise((r) => setTimeout(r, waitSec * 1000));
+      } else {
+        console.log(`[proxy] TinProxy error (${safeMessage}); retrying in 10s (${attempt + 1}/${maxAttempts})...`);
+        await new Promise((r) => setTimeout(r, 10000));
+      }
+    }
+  }
+  throw lastErr;
 }
 
 module.exports = {
@@ -176,4 +277,5 @@ module.exports = {
   isPermanentProxyError,
   parseProxyString,
   fetchViaProxy,
+  getNewTinProxyWithRetry,
 };

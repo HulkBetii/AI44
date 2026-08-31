@@ -1,4 +1,18 @@
 const assert = require('assert');
+const fs = require('fs');
+const path = require('path');
+
+const signupSource = fs.readFileSync(path.join(__dirname, '..', 'signup-hotmail.js'), 'utf8');
+assert.ok(!/await update(?:Status|Password|PasswordAndStatus|Result)\(/.test(signupSource));
+for (const helper of [
+  'updateStatusByEmail',
+  'updatePasswordByEmail',
+  'updatePasswordAndStatusByEmail',
+  'updateResultByEmail',
+]) {
+  assert.ok(signupSource.includes(helper));
+}
+console.log('✓ automation Sheet mutations use stable email identity helpers');
 
 // Stub googleapis before sheets.js pulls it in, so no network or real credentials are used.
 const gapi = require('googleapis');
@@ -11,6 +25,7 @@ gapi.google.sheets = () => ({
       get: async (a) => { calls.push(['get', a.range]); return getResponse; },
       update: async (a) => { calls.push(['update', a.range, a.requestBody.values]); },
       batchUpdate: async (a) => { calls.push(['batchUpdate', a.requestBody.data.map(d => d.range)]); },
+      append: async (a) => { calls.push(['append', a.range, a.requestBody.values]); return { data: { updates: { updatedRows: a.requestBody.values.length } } }; },
     },
   },
 });
@@ -64,17 +79,54 @@ const S = require('../sheets.js');
   assert.strictEqual(short[0].apiKey, '');
   console.log('✓ short rows tolerated');
 
-  // 6. Reset batches into one request.
+  // 6. Identity writes re-read the sheet and follow a row move instead of using a stale index.
+  getResponse = { data: { values: [
+    ['email', 'password', 'msaToken', 'tenantGuid', 'recoveryEmail', 'apiKey', 'elevenPass', 'status'],
+    ['other@x.com', 'p1', '', '', '', '', '', 'pending'],
+    ['', '', '', '', '', '', '', ''],
+    ['Moved@Example.com', 'p2', '', '', '', '', 'old-pass', 'pending'],
+  ] } };
+  calls.length = 0;
+  const moved = await S.updatePasswordByEmail('moved@example.com', 'new-pass');
+  assert.strictEqual(moved.rowIndex, 4);
+  assert.deepStrictEqual(calls, [
+    ['get', 'hotmail!A:I'],
+    ['update', 'hotmail!G4:G4', [['new-pass']]],
+  ]);
+  console.log('✓ identity writes follow the unique email after a Sheet row move');
+
+  getResponse = { data: { values: [
+    ['email'],
+    ['duplicate@example.com'],
+    ['DUPLICATE@example.com'],
+  ] } };
+  calls.length = 0;
+  await assert.rejects(
+    () => S.updateResultByEmail('duplicate@example.com', 'sk_x', 'pass', 'complete'),
+    /found 2/,
+  );
+  assert.deepStrictEqual(calls, [['get', 'hotmail!A:I']]);
+  await assert.rejects(() => S.updateStatusByEmail('missing@example.com', 'pending'), /found 0/);
+  assert.strictEqual(calls.filter(([kind]) => kind === 'update').length, 0);
+  console.log('✓ missing and duplicate email identities fail before any Sheet mutation');
+
+  // 7. Reset batches into one request.
   calls.length = 0;
   await S.resetRows([2, 4]);
   assert.deepStrictEqual(calls[0], ['batchUpdate', ['hotmail!F2:H2', 'hotmail!F4:H4']]);
   assert.strictEqual(calls.length, 1, 'reset must be a single batched request');
   console.log('✓ resetRows batches into one call');
 
+  // 8. Append rows
   calls.length = 0;
-  await S.resetRows([]);
+  await S.appendRows([['user@x.com', 'p1', 'tok', 'guid', '', '', '', 'pending', '']]);
+  assert.deepStrictEqual(calls[0], ['append', 'hotmail!A:I', [['user@x.com', 'p1', 'tok', 'guid', '', '', '', 'pending', '']]]);
+  console.log('✓ appendRows writes to A:I');
+
+  calls.length = 0;
+  await S.appendRows([]);
   assert.strictEqual(calls.length, 0);
-  console.log('✓ resetRows no-ops on empty input');
+  console.log('✓ appendRows no-ops on empty input');
 
   console.log('\nAll assertions passed.');
 })().catch(e => { console.error('FAILED:', e.message); process.exit(1); });

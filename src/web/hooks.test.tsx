@@ -64,8 +64,8 @@ describe('job event stream', () => {
     expect(notify).not.toHaveBeenCalled();
 
     act(() => EventSourceStub.instance.emit('replay-end'));
-    expect(invalidate.mock.calls.filter(([filters]) => filters.queryKey?.[0] === 'jobs')).toHaveLength(1);
-    expect(invalidate.mock.calls.filter(([filters]) => filters.queryKey?.[0] === 'job')).toHaveLength(1);
+    expect(invalidate.mock.calls.filter(([filters]) => filters?.queryKey?.[0] === 'jobs')).toHaveLength(1);
+    expect(invalidate.mock.calls.filter(([filters]) => filters?.queryKey?.[0] === 'job')).toHaveLength(1);
     expect(notify).not.toHaveBeenCalled();
   });
 
@@ -187,5 +187,20 @@ describe('job event stream', () => {
 
     expect(invalidate).toHaveBeenCalledWith({ queryKey: ['accounts'] });
     expect(invalidate).toHaveBeenCalledWith({ queryKey: ['account'] });
+  });
+
+  it('refreshes account runtime labels when the worker changes step', () => {
+    vi.stubGlobal('Notification', Object.assign(vi.fn(), { permission: 'denied' }));
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const invalidate = vi.spyOn(client, 'invalidateQueries').mockResolvedValue();
+
+    render(<QueryClientProvider client={client}><Harness /></QueryClientProvider>);
+    act(() => {
+      EventSourceStub.instance.emit('replay-end');
+      EventSourceStub.instance.emit('job-event', event({ type: 'step.changed', level: 'info' }));
+    });
+
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: ['accounts'] });
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: ['account', 2] });
   });
 });
