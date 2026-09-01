@@ -566,9 +566,15 @@ async function loginMicrosoft(ctx, hotmailEmail, hotmailPassword) {
   }
   if (!reachedInbox && !loginPage.url().includes('outlook.live.com')) {
     const redirectUrl = loginPage.url();
-    // Microsoft silently redirects bad-credential logins to the Outlook marketing page
-    // instead of showing an error on the login form (seen on Vietnamese locale browsers).
     if (redirectUrl.includes('microsoft.com') && redirectUrl.includes('outlook')) {
+      // Check page body: "high demand" / "try again later" = server overload, not bad credentials.
+      const bodyText = await loginPage.evaluate(() => document.body.innerText || '').catch(() => '');
+      const isOverloaded = /high demand|try again later|experiencing.*demand/i.test(bodyText);
+      if (isOverloaded) {
+        throw microsoftLoginError('MS_NETWORK',
+          `MS login: Microsoft server overloaded — redirected to Outlook marketing page (${redirectUrl})`);
+      }
+      // Silent redirect without error page = bad credentials (seen on Vietnamese locale browsers).
       throw microsoftLoginError('MS_BAD_CREDENTIALS',
         `MS login: password rejected — redirected to Outlook marketing page (${redirectUrl})`);
     }
@@ -980,8 +986,7 @@ async function attemptSignIn(page, email, elevenPassword) {
     .or(page.getByText('No user is found', { exact: false }))
     .or(page.getByText('Incorrect email', { exact: false }))
     .or(page.getByText('Incorrect password', { exact: false }))
-    .or(page.getByText('Invalid credentials', { exact: false }))
-    .or(page.locator('[role="alert"], [data-testid="error-message"]'));
+    .or(page.getByText('Invalid credentials', { exact: false }));
 
   const SETTLE_MS = 30000;
   const outcome = await firstOutcome([
@@ -994,8 +999,10 @@ async function attemptSignIn(page, email, elevenPassword) {
       promise: rejectionMatcher.first().waitFor({ timeout: SETTLE_MS }) },
   ], SETTLE_MS);
 
+  // If URL already left sign-in, the navigation won regardless of what the race returned.
+  if (!page.url().includes('sign-in')) return SIGN_IN.OK;
+
   if (!outcome) {
-    if (!page.url().includes('sign-in')) return SIGN_IN.OK;
     const bodyText = await page.evaluate(() => document.body.innerText).catch(() => '');
     if (/No user is found|Incorrect email|Incorrect password|Invalid credentials|Wrong password|Invalid email/i.test(bodyText)) {
       return SIGN_IN.REJECTED;
@@ -1314,7 +1321,11 @@ ${'═'.repeat(60)}`);
     await firstPresent(page, ['input[type="password"]:visible'], 'new password field');
   }
   for (let i = 0; i < fieldCount; i++) {
-    await fields.nth(i).fill(newPassword);
+    const field = fields.nth(i);
+    await field.click();
+    await field.fill('');
+    // typeHuman expects a selector string; use keyboard directly after focusing via click
+    await page.keyboard.type(newPassword, { delay: 40 + Math.random() * 60 });
     await page.waitForTimeout(200);
   }
   console.log(`[reset] Filled ${fieldCount} password field(s).`);
@@ -1350,29 +1361,29 @@ ${'═'.repeat(60)}`);
   });
   await clickHuman(page, saveButton);
 
-  // Confirm the reset landed before trusting the new password.
-  // Success navigates away from /app/action AND /sign-in/reset-password.
-  // An expired link silently redirects to /sign-in/reset-password (not /app/action),
-  // so checking only for the absence of /app/action incorrectly passes.
-  const changed = await page.waitForURL(
-    (url) => {
-      const s = url.toString();
-      return !s.includes('/app/action') && !s.includes('/sign-in/reset-password');
-    },
-    { timeout: 20000 },
-  ).then(() => true).catch(() => false);
-
+  // ElevenLabs shows the success message ("Password has been changed") ON the same
+  // /sign-in/reset-password URL — it does not navigate away on success.
+  // An expired link also lands on /sign-in/reset-password but shows "Something went wrong".
+  // Therefore URL alone is useless; body text is the only reliable signal.
   await page.waitForTimeout(2000);
   console.log(`[reset] Post-reset page location: ${safePageLocation(page)}`);
 
-  if (!changed || page.url().includes('/sign-in/reset-password') || page.url().includes('/app/action')) {
-    const bodyText = await page.evaluate(() => document.body.innerText || '').catch(() => '');
-    throw new Error(`Password change was not confirmed — page stayed on reset form. Body: ${bodyText.split('\n')[0]}`);
-  }
-
   const postResetText = await page.evaluate(() => document.body.innerText || '').catch(() => '');
-  if (/something went wrong|expired|invalid/i.test(postResetText) && !/password has been changed/i.test(postResetText)) {
-    throw new Error(`Password reset rejected by ElevenLabs: ${postResetText.split('\n')[0] || 'Unknown error'}`);
+  const passwordChanged = /password has been changed|successfully changed your password/i.test(postResetText);
+  const resetFailed = /something went wrong|expired|invalid link/i.test(postResetText);
+
+  if (!passwordChanged) {
+    if (resetFailed) {
+      throw new Error(`Password reset rejected by ElevenLabs: ${postResetText.split('\n')[0] || 'Unknown error'}`);
+    }
+    // Neither success nor known failure — URL might have navigated elsewhere
+    if (page.url().includes('/app/action')) {
+      throw new Error('Password change was not confirmed — still on action URL');
+    }
+    // If we reached a completely different page without success text, assume expired
+    if (page.url().includes('/sign-in/reset-password')) {
+      throw new Error(`Password reset page showed no confirmation. Body: ${postResetText.split('\n')[0]}`);
+    }
   }
 
   step('reset — sign in with new password');
@@ -1392,7 +1403,29 @@ ${'═'.repeat(60)}`);
   await page.waitForSelector(SIGN_IN_EMAIL_SELECTOR, { timeout: 20000 });
   await page.waitForTimeout(1000);
 
-  const outcome = await attemptSignIn(page, email, newPassword);
+  // ElevenLabs may take a few seconds to propagate the new password — retry with backoff.
+  let outcome = SIGN_IN.REJECTED;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    if (attempt > 1) {
+      console.log(`[reset] Sign-in attempt ${attempt}/3 after password reset (waiting 5s)...`);
+      await page.waitForTimeout(5000);
+      await page.goto('https://elevenlabs.io/app/sign-in', { waitUntil: 'domcontentloaded' });
+      await page.waitForTimeout(2000);
+      // If already logged in, the server redirects straight to /app/home or /app/onboarding
+      const afterGotoUrl = page.url();
+      if (afterGotoUrl.includes('/app/home') || afterGotoUrl.includes('/app/onboarding')
+        || afterGotoUrl.includes('/app/') && !afterGotoUrl.includes('/app/sign-in')) {
+        console.log(`[reset] Already signed in (redirected to ${afterGotoUrl}), treating as OK`);
+        outcome = SIGN_IN.OK;
+        break;
+      }
+      await page.waitForSelector(SIGN_IN_EMAIL_SELECTOR, { timeout: 20000 });
+      await page.waitForTimeout(1000);
+    }
+    outcome = await attemptSignIn(page, email, newPassword);
+    if (outcome === SIGN_IN.OK) break;
+    console.log(`[reset] Sign-in attempt ${attempt}/3 result: ${outcome}`);
+  }
   if (outcome !== SIGN_IN.OK) {
     throw new Error(`Sign-in still failed after password reset (${outcome})`);
   }
