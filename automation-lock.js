@@ -126,7 +126,10 @@ function acquireAutomationLock(owner = 'cli') {
     if (error.code !== 'EEXIST') throw error;
     const current = readAutomationLock();
     if (current.status === 'stale') {
-      throw new Error(`A stale automation lock exists at ${file}. Run "node automation-lock.js --clear-stale" before retrying.`);
+      // Dead process left the lock behind — clear it automatically and retry.
+      console.warn(`[lock] Stale automation lock (PID ${current.owner?.pid || 'unknown'}) cleared automatically.`);
+      try { fs.unlinkSync(file); } catch {}
+      return acquireAutomationLock(owner);
     }
     throw new Error(`Automation is already running under PID ${current.owner?.pid || 'unknown'} (${current.owner?.owner || 'unknown'}).`);
   }

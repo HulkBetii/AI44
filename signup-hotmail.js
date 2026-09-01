@@ -347,14 +347,20 @@ async function detectMicrosoftLoginIssue(page) {
     const credentialError = visibleText('#usernameError') || visibleText('#passwordError');
     if (credentialError) {
       const normalizedError = credentialError.replace(/\s+/g, ' ').trim().toLowerCase();
-      const confirmedCredentialPrefixes = [
+      const confirmedCredentialPatterns = [
+        // English
         'your account or password is incorrect',
         'the account or password is incorrect',
         'your password is incorrect',
         "that microsoft account doesn't exist",
         "we couldn't find an account with that username",
+        // Vietnamese
+        'mật khẩu đó không đúng',
+        'tài khoản hoặc mật khẩu không đúng',
+        'không tìm thấy tài khoản microsoft',
+        'tên người dùng không tồn tại',
       ];
-      const code = confirmedCredentialPrefixes.some((prefix) => normalizedError.startsWith(prefix))
+      const code = confirmedCredentialPatterns.some((pattern) => normalizedError.includes(pattern))
         ? 'MS_BAD_CREDENTIALS'
         : 'MS_UI_CHANGED';
       return { code, message: credentialError };
@@ -528,28 +534,44 @@ async function loginMicrosoft(ctx, hotmailEmail, hotmailPassword) {
   await loginPage.waitForLoadState('domcontentloaded').catch(() => {});
   await loginPage.waitForTimeout(2000);
 
-  // Navigate to Outlook inbox (login.live.com redirects to account.microsoft.com by default)
+  // Navigate to Outlook inbox. For fresh Hotmail accounts that have never used Outlook Web,
+  // outlook.live.com/mail/ redirects to the Microsoft marketing page. Try progressively more
+  // direct URLs until we land on outlook.live.com.
   step('MS login — navigate to Outlook inbox');
-  for (let attempt = 1; attempt <= 3; attempt++) {
-    try {
-      const currentUrl = loginPage.url();
-      if (!currentUrl.includes('outlook.live.com')) {
-        await loginPage.goto('https://outlook.live.com/mail/', { waitUntil: 'domcontentloaded', timeout: 30000 });
-      }
+  const INBOX_URLS = [
+    'https://outlook.live.com/mail/0/inbox',
+    'https://outlook.live.com/owa/',
+    'https://outlook.live.com/mail/',
+  ];
+  let reachedInbox = false;
+  for (let attempt = 1; attempt <= 5; attempt++) {
+    const currentUrl = loginPage.url();
+    if (currentUrl.includes('outlook.live.com')) {
+      reachedInbox = true;
       break;
+    }
+    const targetUrl = INBOX_URLS[Math.min(attempt - 1, INBOX_URLS.length - 1)];
+    console.log(`[MS] Navigating to inbox (attempt ${attempt}): ${targetUrl}`);
+    try {
+      await loginPage.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
     } catch (err) {
-      if (attempt < 3 && /interrupted|net::ERR_ABORTED/i.test(err.message)) {
-        console.warn(`[MS] Inbox navigation interrupted (attempt ${attempt}/3), waiting for page to settle...`);
+      if (/interrupted|net::ERR_ABORTED/i.test(err.message)) {
         await loginPage.waitForLoadState('domcontentloaded').catch(() => {});
         await loginPage.waitForTimeout(2500);
-        continue;
+      } else {
+        throw err;
       }
-      throw err;
     }
+    await loginPage.waitForTimeout(3000);
   }
-  await loginPage.waitForTimeout(5000);
-  const inboxUrl = new URL(loginPage.url());
-  if (inboxUrl.hostname !== 'outlook.live.com') {
+  if (!reachedInbox && !loginPage.url().includes('outlook.live.com')) {
+    const redirectUrl = loginPage.url();
+    // Microsoft silently redirects bad-credential logins to the Outlook marketing page
+    // instead of showing an error on the login form (seen on Vietnamese locale browsers).
+    if (redirectUrl.includes('microsoft.com') && redirectUrl.includes('outlook')) {
+      throw microsoftLoginError('MS_BAD_CREDENTIALS',
+        `MS login: password rejected — redirected to Outlook marketing page (${redirectUrl})`);
+    }
     await throwMicrosoftLoginIssue(
       loginPage,
       `MS login did not reach Outlook inbox; redirected to ${safePageLocation(loginPage)}`,
@@ -1328,16 +1350,26 @@ ${'═'.repeat(60)}`);
   });
   await clickHuman(page, saveButton);
 
-  // Confirm the reset landed before trusting the new password. The page leaves /app/action
-  // on success; a lingering action URL means it did not take.
-  const changed = await page.waitForURL((url) => !url.toString().includes('/app/action'), { timeout: 20000 })
-    .then(() => true).catch(() => false);
-  if (!changed) {
-    throw new Error('Password change was not confirmed by navigation');
-  }
+  // Confirm the reset landed before trusting the new password.
+  // Success navigates away from /app/action AND /sign-in/reset-password.
+  // An expired link silently redirects to /sign-in/reset-password (not /app/action),
+  // so checking only for the absence of /app/action incorrectly passes.
+  const changed = await page.waitForURL(
+    (url) => {
+      const s = url.toString();
+      return !s.includes('/app/action') && !s.includes('/sign-in/reset-password');
+    },
+    { timeout: 20000 },
+  ).then(() => true).catch(() => false);
 
   await page.waitForTimeout(2000);
   console.log(`[reset] Post-reset page location: ${safePageLocation(page)}`);
+
+  if (!changed || page.url().includes('/sign-in/reset-password') || page.url().includes('/app/action')) {
+    const bodyText = await page.evaluate(() => document.body.innerText || '').catch(() => '');
+    throw new Error(`Password change was not confirmed — page stayed on reset form. Body: ${bodyText.split('\n')[0]}`);
+  }
+
   const postResetText = await page.evaluate(() => document.body.innerText || '').catch(() => '');
   if (/something went wrong|expired|invalid/i.test(postResetText) && !/password has been changed/i.test(postResetText)) {
     throw new Error(`Password reset rejected by ElevenLabs: ${postResetText.split('\n')[0] || 'Unknown error'}`);
