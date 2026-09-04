@@ -521,6 +521,24 @@ async function solveWithProvider(page, provider, captchaInfo, tag, proxyString, 
   for (let i = 0; i < MAX_POLLS && remainingTime(deadline) > 0; i++) {
     await waitWithinDeadline(POLL_INTERVAL_MS, deadline);
 
+    // Check if page shows "account already exists" error during solving
+    if (page && !page.isClosed()) {
+      try {
+        const errorText = await page.evaluate(() => {
+          const body = document.body ? document.body.innerText : '';
+          if (/already exists|already registered|already in use|Sign in or reset your password/i.test(body)) {
+            return 'ALREADY_REGISTERED';
+          }
+          return null;
+        }).catch(() => null);
+
+        if (errorText === 'ALREADY_REGISTERED') {
+          console.log(`${tag} Detected 'account already exists' on page. Aborting CAPTCHA solving immediately.`);
+          return { solved: false, reason: 'ALREADY_REGISTERED', alreadyRegistered: true };
+        }
+      } catch {}
+    }
+
     try {
       const result = await apiPost(
         apiBase,
@@ -551,7 +569,7 @@ async function solveWithProvider(page, provider, captchaInfo, tag, proxyString, 
 }
 
 // Main entry point. Tries each compatible provider in order until one succeeds.
-async function solveCaptcha(page, proxyString = '') {
+async function solveCaptcha(page, proxyString = '', options = {}) {
   const config = loadConfig();
   const deadline = Date.now() + SOLVER_DEADLINE_MS;
 
@@ -567,7 +585,7 @@ async function solveCaptcha(page, proxyString = '') {
   // Poll for CAPTCHA widget dynamically for up to 6 seconds after submission
   let captchaInfo = null;
   for (let attempt = 0; attempt < 6; attempt++) {
-    if (!page.url().includes('sign-up')) {
+    if (!options.skipUrlCheck && !page.url().includes('sign-up')) {
       return { solved: true, reason: 'Page already navigated away from signup' };
     }
     captchaInfo = await detectCaptcha(page);
@@ -660,6 +678,16 @@ async function solveCaptcha(page, proxyString = '') {
     return { solved: false, reason: `No configured provider supports ${captchaInfo.provider} (${captchaInfo.type})` };
   }
 
+  // Prioritize preferred provider if specified
+  if (options.preferredProvider) {
+    const preferred = compatible.find(
+      (p) => p.name.toLowerCase() === options.preferredProvider.toLowerCase()
+    );
+    if (preferred) {
+      compatible = [preferred, ...compatible.filter((p) => p !== preferred)];
+    }
+  }
+
   console.log(`[captcha] Compatible providers: ${compatible.map((p) => p.name).join(', ')}`);
 
   // Try each compatible provider in priority order
@@ -708,70 +736,26 @@ async function injectToken(page, captchaInfo, token) {
         ta.dispatchEvent(new Event('change', { bubbles: true }));
       });
 
+      // Get all widget IDs
+      const widgetIds = [];
+      try {
+        const containers = document.querySelectorAll('[data-hcaptcha-widget-id]');
+        containers.forEach((el) => {
+          const wid = el.getAttribute('data-hcaptcha-widget-id');
+          if (wid) widgetIds.push(wid);
+        });
+        if (widgetIds.length === 0 && typeof window.hcaptcha !== 'undefined' && window.hcaptcha._hcaptcha) {
+          const ids = Object.keys(window.hcaptcha._hcaptcha);
+          ids.forEach((id) => { if (/^\d+$/.test(id)) widgetIds.push(id); });
+        }
+      } catch {}
+
       // 2. Use hcaptcha SDK setResponse if available
       if (typeof window.hcaptcha !== 'undefined') {
-        try {
-          // Get all widget IDs
-          const widgetIds = [];
-          const containers = document.querySelectorAll('[data-hcaptcha-widget-id]');
-          containers.forEach((el) => {
-            const wid = el.getAttribute('data-hcaptcha-widget-id');
-            if (wid) widgetIds.push(wid);
-          });
-          // Fallback: get from hcaptcha internal state
-          if (widgetIds.length === 0 && window.hcaptcha._hcaptcha) {
-            const ids = Object.keys(window.hcaptcha._hcaptcha);
-            ids.forEach((id) => { if (/^\d+$/.test(id)) widgetIds.push(id); });
-          }
-          // Set response for each widget
-          for (const wid of widgetIds) {
-            try { window.hcaptcha.setResponse(wid, tkn); } catch {}
-          }
-        } catch {}
-
-        // 3. Walk React fiber tree to find onVerify callback from HiddenHCaptcha
-        try {
-          const hcaptchaContainers = document.querySelectorAll('.h-captcha, [data-hcaptcha-widget-id], div[id^="hcaptcha"]');
-          for (const container of hcaptchaContainers) {
-            // Walk up to find React internal instance
-            const fiberKey = Object.keys(container).find((k) => k.startsWith('__reactFiber$') || k.startsWith('__reactInternalInstance$'));
-            if (!fiberKey) continue;
-            let fiber = container[fiberKey];
-            // Walk up the fiber tree looking for onVerify prop
-            for (let i = 0; i < 20 && fiber; i++) {
-              const props = fiber.memoizedProps || fiber.pendingProps;
-              if (props?.onVerify && typeof props.onVerify === 'function') {
-                props.onVerify(tkn);
-                break;
-              }
-              fiber = fiber.return;
-            }
-          }
-        } catch {}
-
-        // 3.5. Emulate iframe postMessage (mimics human solve for hCaptcha SDK)
-        try {
-          const iframes = document.querySelectorAll('iframe[src*="hcaptcha.com"]');
-          for (const wid of widgetIds) {
-            const data = JSON.stringify({
-              source: 'hcaptcha',
-              label: 'challenge-closed',
-              id: wid,
-              contents: {
-                event: 'challenge-passed',
-                response: tkn,
-                expiration: 120
-              }
-            });
-            const event = new MessageEvent('message', {
-              data: data,
-              origin: 'https://newassets.hcaptcha.com',
-              source: iframes[0]?.contentWindow || window
-            });
-            window.dispatchEvent(event);
-          }
-        } catch {}
-
+        for (const wid of widgetIds) {
+          try { window.hcaptcha.setResponse(wid, tkn); } catch {}
+        }
+        
         // 4. Fallback: try hcaptcha internal client callbacks
         try {
           const clients = window.hcaptcha._hcaptcha?.cfg?.clients;
@@ -784,6 +768,55 @@ async function injectToken(page, captchaInfo, token) {
           }
         } catch {}
       }
+
+      // 3. Walk React fiber tree to find onVerify callback from HiddenHCaptcha
+      try {
+        const hcaptchaContainers = document.querySelectorAll('.h-captcha, [data-hcaptcha-widget-id], div[id^="hcaptcha"], iframe[src*="hcaptcha.com"]');
+        for (const container of hcaptchaContainers) {
+          let fiberKey = Object.keys(container).find((k) => k.startsWith('__reactFiber$') || k.startsWith('__reactInternalInstance$'));
+          if (!fiberKey) {
+            // Try parent node if iframe
+            const parent = container.parentElement;
+            if (parent) {
+              fiberKey = Object.keys(parent).find((k) => k.startsWith('__reactFiber$') || k.startsWith('__reactInternalInstance$'));
+              if (fiberKey) container = parent;
+            }
+          }
+          if (!fiberKey) continue;
+          let fiber = container[fiberKey];
+          for (let i = 0; i < 30 && fiber; i++) {
+            const props = fiber.memoizedProps || fiber.pendingProps;
+            if (props?.onVerify && typeof props.onVerify === 'function') {
+              props.onVerify(tkn);
+              break;
+            }
+            fiber = fiber.return;
+          }
+        }
+      } catch {}
+
+      // 3.5. Emulate iframe postMessage (mimics human solve for hCaptcha SDK)
+      try {
+        const iframes = document.querySelectorAll('iframe[src*="hcaptcha.com"]');
+        for (const wid of widgetIds.length ? widgetIds : ['']) { // Try empty ID if none found
+          const data = JSON.stringify({
+            source: 'hcaptcha',
+            label: 'challenge-closed',
+            id: wid,
+            contents: {
+              event: 'challenge-passed',
+              response: tkn,
+              expiration: 120
+            }
+          });
+          const event = new MessageEvent('message', {
+            data: data,
+            origin: 'https://newassets.hcaptcha.com',
+            source: iframes[0]?.contentWindow || window
+          });
+          window.dispatchEvent(event);
+        }
+      } catch {}
 
       // 5. Remove hCaptcha challenge overlay so it doesn't block the page
       // DISABLED: If the token is rejected by ElevenLabs, deleting the iframe breaks the UI
@@ -860,4 +893,4 @@ async function injectToken(page, captchaInfo, token) {
   }
 }
 
-module.exports = { apiPost, solveCaptcha, detectCaptcha, loadConfig };
+module.exports = { apiPost, solveCaptcha, detectCaptcha, loadConfig, injectToken };

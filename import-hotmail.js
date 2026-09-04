@@ -21,7 +21,8 @@ async function importAccounts(filePath = 'C:\\Users\\HulkBeoti\\Documents\\hotma
   let skippedDuplicates = 0;
 
   for (const line of lines) {
-    const parts = line.split('|');
+    const cleanedLine = line.replace(/^\d+[\.\:\-\s]+/, '').trim();
+    const parts = cleanedLine.split('|');
     if (parts.length < 2) continue;
 
     const email = (parts[0] || '').trim();
@@ -34,7 +35,7 @@ async function importAccounts(filePath = 'C:\\Users\\HulkBeoti\\Documents\\hotma
     const status = 'pending';
     const proxyToken = '';
 
-    if (!email) continue;
+    if (!email || !email.includes('@')) continue;
 
     if (existingEmails.has(email.toLowerCase())) {
       skippedDuplicates++;

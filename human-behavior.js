@@ -250,7 +250,11 @@ async function typeHuman(page, selector, text) {
   // verification, and typing on top of that produced exactly double the value - a live run
   // logged 58 characters for a 29-character address. The repair below rescued it, but only
   // after typing the whole thing twice.
-  await page.fill(selector, '');
+  if (typeof selector === 'string') {
+    await page.fill(selector, '');
+  } else {
+    await selector.fill('');
+  }
   
   for (let i = 0; i < text.length; i++) {
     const char = text[i];
@@ -288,14 +292,17 @@ async function typeHuman(page, selector, text) {
   }
 
   // Khắc phục lỗi React re-render làm rơi ký tự
-  const landed = await page.inputValue(selector);
+  const getVal = () => (typeof selector === 'string' ? page.inputValue(selector) : selector.inputValue());
+  const setVal = (v) => (typeof selector === 'string' ? page.fill(selector, v) : selector.fill(v));
+
+  const landed = await getVal();
   if (landed !== text) {
     const how = landed.length > text.length ? 'over-filled' : 'truncated';
     console.warn(`[type] field ${how} (${landed.length}/${text.length} chars) - repairing`);
-    await page.fill(selector, text);
-    const repaired = await page.inputValue(selector);
+    await setVal(text);
+    const repaired = await getVal();
     if (repaired !== text) {
-      throw new Error(`Could not set ${selector}: wanted ${text.length} chars, field holds ${repaired.length}`);
+      throw new Error(`Could not set field: wanted ${text.length} chars, field holds ${repaired.length}`);
     }
   }
 }

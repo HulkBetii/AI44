@@ -310,7 +310,7 @@ async function createProfile(name, proxy = '') {
   // Persist intent before the remote mutation. If this process exits while /create is in
   // flight, the next run must reconcile instead of assuming no profile was created.
   const evidence = recordUncertainCreate(name, beforeIds);
-  const endpoint = `/v2/create?name=${encodeURIComponent(name)}${proxyParam}&canvas=on&font=on&webrtc=on`;
+  const endpoint = `/v2/create?name=${encodeURIComponent(name)}${proxyParam}&canvas=off&font=off&webrtc=on`;
   try {
     const res = await callApi(endpoint);
     if (res?.profile_id) {

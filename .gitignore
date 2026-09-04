@@ -1,9 +1,9 @@
 node_modules/
 chrome-profile/
 accounts.json
-debug-before-signup.png
-debug-after-signup.png
-debug-failure*.png
+*.png
+*.html
+catch-all-keys.txt
 service-account.json
 hotmail.csv
 success_accounts.csv

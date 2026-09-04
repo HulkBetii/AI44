@@ -16,7 +16,11 @@
     "test:typecheck": "tsc -p tsconfig.server-tests.json && tsc -p tsconfig.web.json",
     "test:legacy": "node test/run-all.js",
     "test:new": "vitest run",
-    "batch": "node batch.js"
+    "batch": "node batch.js",
+    "signup:catchall": "node catch-all-signup/index.js",
+    "generate:catchall": "node catch-all-signup/email-generator.js",
+    "trial:gpt": "node trial-gpt/index.js",
+    "reg:gmail": "node reg-gmail/index.js"
   },
   "keywords": [],
   "author": "",
@@ -29,7 +33,9 @@
     "@tanstack/react-table": "^9.1.2",
     "express": "^5.2.1",
     "googleapis": "^176.0.0",
+    "imap-simple": "^5.1.0",
     "lucide-react": "^1.33.0",
+    "mailparser": "^3.9.20",
     "playwright": "^1.62.1",
     "playwright-extra": "^4.3.6",
     "playwright-extra-plugin-stealth": "^0.0.1",

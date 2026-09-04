@@ -555,33 +555,57 @@ async function loginMicrosoft(ctx, hotmailEmail, hotmailPassword) {
     try {
       await loginPage.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
     } catch (err) {
-      if (/interrupted|net::ERR_ABORTED/i.test(err.message)) {
+      if (/interrupted|net::ERR_ABORTED|net::ERR_NETWORK_CHANGED|net::ERR_CONNECTION_RESET|net::ERR_TIMED_OUT|net::ERR_NAME_NOT_RESOLVED/i.test(err.message)) {
+        console.log(`[MS] Transient network error (attempt ${attempt}): ${err.message.split('\n')[0]}`);
         await loginPage.waitForLoadState('domcontentloaded').catch(() => {});
-        await loginPage.waitForTimeout(2500);
+        await loginPage.waitForTimeout(3000);
       } else {
         throw err;
       }
     }
     await loginPage.waitForTimeout(3000);
   }
-  if (!reachedInbox && !loginPage.url().includes('outlook.live.com')) {
-    const redirectUrl = loginPage.url();
-    if (redirectUrl.includes('microsoft.com') && redirectUrl.includes('outlook')) {
-      // Check page body: "high demand" / "try again later" = server overload, not bad credentials.
-      const bodyText = await loginPage.evaluate(() => document.body.innerText || '').catch(() => '');
-      const isOverloaded = /high demand|try again later|experiencing.*demand/i.test(bodyText);
-      if (isOverloaded) {
-        throw microsoftLoginError('MS_NETWORK',
-          `MS login: Microsoft server overloaded — redirected to Outlook marketing page (${redirectUrl})`);
+  // The inbox may temporarily reflect the correct URL before a JS redirect kicks in.
+  // Wait explicitly for either an inbox DOM element, or the marketing page URL.
+  const outcome = await Promise.race([
+    loginPage.waitForSelector('#O365_MainLink_Logo, [role="option"]', { timeout: 15000 }).then(() => 'inbox'),
+    loginPage.waitForURL(url => url.toString().includes('microsoft.com') && url.toString().includes('outlook'), { timeout: 15000 }).then(() => 'marketing')
+  ]).catch(() => 'timeout');
+
+  const finalUrl = loginPage.url();
+
+  if (outcome === 'marketing' || (outcome === 'timeout' && !finalUrl.includes('mail/0') && !finalUrl.includes('owa') && !finalUrl.includes('outlook.live.com/mail'))) {
+    if (finalUrl.includes('microsoft.com') && finalUrl.includes('outlook')) {
+      console.log('[MS] Landed on marketing page. Attempting Sign in click to reach webmail...');
+      const signInLink = loginPage.locator('a[data-bi-name="SignIn"], a:has-text("Đăng nhập"), a:has-text("Sign in")').first();
+      if (await signInLink.isVisible({ timeout: 3000 }).catch(() => false)) {
+        await signInLink.click().catch(() => {});
+        await loginPage.waitForTimeout(4000);
+      } else {
+        await loginPage.goto('https://outlook.live.com/mail/0/', { waitUntil: 'domcontentloaded', timeout: 25000 }).catch(() => {});
+        await loginPage.waitForTimeout(3000);
       }
-      // Silent redirect without error page = bad credentials (seen on Vietnamese locale browsers).
-      throw microsoftLoginError('MS_BAD_CREDENTIALS',
-        `MS login: password rejected — redirected to Outlook marketing page (${redirectUrl})`);
+
+      if (loginPage.url().includes('outlook.live.com')) {
+        console.log(`[MS] Successfully recovered to Outlook inbox: ${loginPage.url()}`);
+      } else {
+        // Check page body: "high demand" / "try again later" = server overload, not bad credentials.
+        const bodyText = await loginPage.evaluate(() => document.body.innerText || '').catch(() => '');
+        const isOverloaded = /high demand|try again later|experiencing.*demand/i.test(bodyText);
+        if (isOverloaded) {
+          throw microsoftLoginError('MS_NETWORK',
+            `MS login: Microsoft server overloaded — redirected to Outlook marketing page (${loginPage.url()})`);
+        }
+        throw microsoftLoginError('MS_BAD_CREDENTIALS',
+          `MS login: password rejected — redirected to Outlook marketing page (${loginPage.url()})`);
+      }
+    } else {
+      // If it's not the marketing page, but still not the inbox, we throw a general issue
+      await throwMicrosoftLoginIssue(
+        loginPage,
+        `MS login did not reach Outlook inbox; redirected to ${safePageLocation(loginPage)}`,
+      );
     }
-    await throwMicrosoftLoginIssue(
-      loginPage,
-      `MS login did not reach Outlook inbox; redirected to ${safePageLocation(loginPage)}`,
-    );
   }
   await dismissConsentDialog(loginPage);
   console.log(`[MS] Inbox loaded: ${safePageLocation(loginPage)}`);
@@ -601,12 +625,27 @@ async function loginMicrosoft(ctx, hotmailEmail, hotmailPassword) {
 //
 // Deliberately narrow. "Already have an account? Log in" is standing text on this very page,
 // so anything looser than this would abort every signup instead of the rejected ones.
-const SIGNUP_REJECTED = /(?:(?:(?:this|that)\s+)?(?:email|address)\s+(?:is\s+already\s+(?:in use|registered|taken)|has\s+already\s+been\s+(?:registered|taken|used))|an?\s+account\s+with\s+(?:this|that)\s+(?:email|address)\s+already\s+exists)/i;
+const SIGNUP_REJECTED = /(?:(?:(?:this|that)\s+)?(?:email|address)\s+(?:is\s+already\s+(?:in use|registered|taken)|has\s+already\s+been\s+(?:registered|taken|used))|an?\s+account\s+(?:already\s+exists\s+with\s+(?:this|that)\s+(?:email|address)|with\s+(?:this|that)\s+(?:email|address)\s+already\s+exists))/i;
 
 async function waitForManualSignup(page) {
   const BELL = String.fromCharCode(7);
-  const TICK_MS = 30000;
-  const totalSec = Math.round(SIGNUP_TIMEOUT_MS / 1000);
+
+  // First, check synchronously if it's already rejected.
+  // This prevents race conditions if the error is already on screen (e.g. after a long CAPTCHA timeout).
+  const isAlreadyRejected = await page.evaluate((source) => {
+    return new RegExp(source, 'i').test(document.body.innerText || '');
+  }, SIGNUP_REJECTED.source).catch(() => false);
+
+  if (isAlreadyRejected) {
+    const said = await page.evaluate((source) => {
+      const re = new RegExp(source, 'i');
+      return (document.body.innerText || '').split('\n')
+        .map((l) => l.trim()).find((l) => re.test(l)) || '';
+    }, SIGNUP_REJECTED.source).catch(() => '');
+    const refused = new Error(`ElevenLabs refused the address: ${said || '(message not captured)'}`);
+    refused.code = 'ALREADY_REGISTERED';
+    throw refused;
+  }
 
   process.stdout.write(BELL);
   await page.bringToFront().catch(() => {});
@@ -617,11 +656,11 @@ async function waitForManualSignup(page) {
 
   const started = Date.now();
   let ticks = 0;
+  const totalSec = Math.round(SIGNUP_TIMEOUT_MS / 1000);
+  const TICK_MS = 3000;
   const ticker = setInterval(() => {
     ticks++;
-    console.log(`   …waiting ${Math.round((Date.now() - started) / 1000)}s / ${totalSec}s`);
-    // Re-ring once a minute rather than every tick: enough to call someone back, not enough
-    // to madden someone already sitting there.
+    console.log(`   ⏳ waiting ${Math.round((Date.now() - started) / 1000)}s / ${totalSec}s`);
     if (ticks % 2 === 0) process.stdout.write(BELL);
   }, TICK_MS);
 
@@ -629,10 +668,10 @@ async function waitForManualSignup(page) {
     const settled = await Promise.race([
       page.waitForURL((url) => !url.toString().includes('/sign-up'), { timeout: SIGNUP_TIMEOUT_MS })
         .then(() => 'url-changed').catch(() => null),
-      page.waitForSelector('button:has-text("Resend")', { timeout: SIGNUP_TIMEOUT_MS })
+      page.waitForSelector('text=/Check your email|Check your inbox|verify your email/i', { state: 'visible', timeout: SIGNUP_TIMEOUT_MS })
         .then(() => 'resend-shown').catch(() => null),
-      // Interval polling rather than the default rAF: a backgrounded tab stops animation
-      // frames, which is exactly the state this branch has to keep working in.
+      page.waitForSelector('button:has-text("Resend")', { state: 'visible', timeout: SIGNUP_TIMEOUT_MS })
+        .then(() => 'resend-shown').catch(() => null),
       page.waitForFunction(
         (source) => new RegExp(source, 'i').test(document.body.innerText || ''),
         SIGNUP_REJECTED.source,
@@ -703,6 +742,10 @@ async function pollOutlookInbox(
       await outookPage.waitForSelector('[role="option"]', { timeout: LIST_RENDER_TIMEOUT_MS })
         .catch(() => {});
 
+      if (outookPage.url().includes('microsoft.com') || outookPage.url().includes('login.live.com')) {
+        throw new Error(`MS session dropped during polling; redirected to ${outookPage.url()}`);
+      }
+
       // Each folder navigation can re-raise the consent modal, and it covers the message list.
       await dismissConsentDialog(outookPage);
 
@@ -715,26 +758,67 @@ async function pollOutlookInbox(
       for (let i = 0; i < count; i++) {
         // Outlook renders each message row with role="option".
         const rowLocator = outookPage.locator('[role="option"]').filter({ hasText: 'ElevenLabs' }).nth(i);
-        if (notBefore) {
-          const receivedAt = await rowLocator.evaluate((row) => {
+        const sender = await rowLocator.evaluate((row) => row.querySelector('[class*="Persona"], span[title]')?.textContent || '').catch(() => '');
+        const subject = await rowLocator.evaluate((row) => row.querySelector('[class*="subject"], [title]')?.textContent || row.getAttribute('aria-label') || '').catch(() => '');
+        
+        const isElevenLabs = /ElevenLabs/i.test(sender) || /ElevenLabs/i.test(subject);
+        if (!isElevenLabs) continue;
+
+        if (mode === 'resetPassword' && !/Reset your password/i.test(subject) && !/password/i.test(subject)) {
+          console.log(`[inbox] Email ${i} is not a reset password email (subject: "${subject}"), skipping.`);
+          continue;
+        }
+        if (mode === 'verifyEmail' && !/Verify your email/i.test(subject)) {
+          console.log(`[inbox] Email ${i} is not a verification email (subject: "${subject}"), skipping.`);
+          continue;
+        }
+
+        const receivedAt = await rowLocator.evaluate((row) => {
             const time = row.querySelector('time[datetime]');
-            const raw = time?.getAttribute('datetime')
+            const raw = (time?.getAttribute('datetime')
               || row.getAttribute('data-received-at')
               || row.getAttribute('data-timestamp')
               || row.getAttribute('title')
               || row.getAttribute('aria-label')
               || time?.textContent
-              || '';
+              || '').trim();
             const numeric = Number(raw);
-            if (Number.isFinite(numeric) && numeric > 1e12) return numeric;
-            const parsed = Date.parse(raw);
-            return Number.isFinite(parsed) ? parsed : null;
-          }).catch(() => null);
-          // Outlook often renders only a localized clock value (for example "10:22 PM")
-          // without a machine-readable datetime. An unknown timestamp must remain a
-          // candidate; otherwise a fresh, visible reset email is skipped before it is clicked.
-          if (Number.isFinite(receivedAt) && receivedAt < notBefore) continue;
-        }
+            if (Number.isFinite(numeric) && numeric > 1e12) return { raw, parsed: numeric };
+            let parsed = Date.parse(raw);
+            if (!Number.isFinite(parsed)) {
+              const dayMatch = raw.match(/\b(?:Yesterday|Mon|Tue|Wed|Thu|Fri|Sat|Sun|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\b/i);
+              if (dayMatch) {
+                parsed = 0; // Not from today
+              } else {
+                const clockMatch = raw.match(/\b(\d{1,2}:\d{2}(?:\s*(?:[ap]m|sa|ch))?)\b/i);
+                if (clockMatch) {
+                  let timeStr = clockMatch[1].toLowerCase();
+                  timeStr = timeStr.replace('sa', 'am').replace('ch', 'pm');
+                  parsed = Date.parse(new Date().toDateString() + ' ' + timeStr);
+                }
+              }
+            }
+            return { raw, parsed: Number.isFinite(parsed) ? parsed : null };
+          }).catch(() => ({ raw: 'error', parsed: null }));
+          
+          console.log(`[inbox] Email ${i} time raw: "${receivedAt.raw}", parsed: ${receivedAt.parsed}`);
+          
+          if (notBefore) {
+            // Outlook UI times are localized to the IP's timezone (e.g. UTC-10), while Date.parse
+            // runs in the host's timezone (e.g. UTC+7). This causes massive offsets (e.g. 17 hours).
+            // Since timezone offsets are multiples of 30 mins, and we poll rapidly, we can deduce
+            // the exact offset by comparing the parsed time to Date.now().
+            const rawDiff = Date.now() - receivedAt.parsed;
+            const tzOffset = Math.round(rawDiff / 1800000) * 1800000; // Nearest 30 mins
+            const trueTimestamp = receivedAt.parsed + tzOffset;
+            
+            // Allow a 60s grace period since Outlook UI truncates seconds (e.g. 12:17:19 -> 12:17:00)
+            const notBeforeGrace = notBefore - 60000;
+            if (Number.isFinite(receivedAt.parsed) && trueTimestamp < notBeforeGrace) {
+              console.log(`[inbox] Email ${i} is older than notBefore (adjusted: ${trueTimestamp} < ${notBeforeGrace}), skipping.`);
+              continue;
+            }
+          }
         await clickHuman(outookPage, rowLocator);
         await outookPage.waitForTimeout(2000);
 
@@ -744,8 +828,9 @@ async function pollOutlookInbox(
           .filter((u) => u.includes(wanted));
         if (links.length > 0) return links[links.length - 1];
       }
-    } catch (e) {
-      console.log(`[inbox] scan error: ${safeErrorText(e)}`);
+    } catch (err) {
+      if (err.message.includes('MS session dropped')) throw err;
+      console.error(`[inbox] scan error: ${err}`);
     }
 
     console.log(`[inbox] No ${mode} email yet, waiting 5s...`);
@@ -848,7 +933,7 @@ async function processAccount(ctx, cred, proxyString = '') {
       }
     }
   } catch (error) {
-    if (error.code === 'ALREADY_REGISTERED') removeRecovery(recoveryEntry.id);
+    if (error.code === 'ALREADY_REGISTERED' || error.code === 'CAPTCHA_TIMEOUT') removeRecovery(recoveryEntry.id);
     throw error;
   }
 
@@ -1260,6 +1345,10 @@ ${'═'.repeat(60)}`);
   console.log(`${'═'.repeat(60)}`);
   console.log('  New ElevenLabs password: [generated and stored securely]');
 
+  step('reset — MS login for reset link');
+  const outlookPage = await loginMicrosoft(ctx, email, hotmailPassword);
+  activePage = outlookPage;
+
   step('reset — request reset email');
   let page = await ctx.newPage();
   activePage = page;
@@ -1289,10 +1378,6 @@ ${'═'.repeat(60)}`);
       throw new Error(`Reset request not confirmed; still at ${safePageLocation(page)}`);
     });
   console.log('[reset] Reset email requested.');
-
-  step('reset — MS login for reset link');
-  const outlookPage = await loginMicrosoft(ctx, email, hotmailPassword);
-  activePage = outlookPage;
 
   step('reset — poll Outlook for reset link');
   const resetUrl = await pollOutlookInbox(
@@ -1425,6 +1510,36 @@ ${'═'.repeat(60)}`);
     outcome = await attemptSignIn(page, email, newPassword);
     if (outcome === SIGN_IN.OK) break;
     console.log(`[reset] Sign-in attempt ${attempt}/3 result: ${outcome}`);
+
+    if (outcome === SIGN_IN.UNVERIFIED && attempt === 1) {
+      console.log('[reset] Account is unverified (fresh link auto-sent by ElevenLabs). Polling Outlook...');
+      const verifyRequestedAt = Date.now() - 30000;
+      step('reset — poll Outlook for verify email');
+      const verifyUrl = await pollOutlookInbox(outlookPage, INBOX_TIMEOUT_MS, 'verifyEmail', verifyRequestedAt);
+      activeAdditionalSecrets.push(...collectUrlSecrets(verifyUrl));
+      
+      step('reset — open verify URL');
+      await page.goto(verifyUrl, { waitUntil: 'domcontentloaded' });
+      
+      step('reset — click Continue');
+      await page.waitForSelector('button:has-text("Continue")', { timeout: 15000 });
+      await clickHuman(page, 'button:has-text("Continue")');
+      await page.waitForTimeout(2000);
+    } else if (outcome === SIGN_IN.UNVERIFIED) {
+      const resendBtn = page.getByRole('button', { name: 'Resend', exact: true }).or(page.locator('button:has-text("Resend")'));
+      if (await resendBtn.count() > 0) {
+        console.log('[reset] Clicking Resend...');
+        const requestedAt = Date.now();
+        await clickHuman(page, resendBtn.first());
+        step('reset — poll Outlook for resend verify email');
+        const verifyUrl = await pollOutlookInbox(outlookPage, INBOX_TIMEOUT_MS, 'verifyEmail', requestedAt);
+        activeAdditionalSecrets.push(...collectUrlSecrets(verifyUrl));
+        await page.goto(verifyUrl, { waitUntil: 'domcontentloaded' });
+        await page.waitForSelector('button:has-text("Continue")', { timeout: 15000 });
+        await clickHuman(page, 'button:has-text("Continue")');
+        await page.waitForTimeout(2000);
+      }
+    }
   }
   if (outcome !== SIGN_IN.OK) {
     throw new Error(`Sign-in still failed after password reset (${outcome})`);
@@ -2064,6 +2179,7 @@ module.exports = {
   auditWeakPasswords,
   cancelActiveRun,
   focusActiveBrowser,
+  loginMicrosoft,
   parseArgs,
   releaseProfile,
   run,
