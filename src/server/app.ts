@@ -11,6 +11,8 @@ import type { JobStore } from './job-store';
 import type { RecoveryService } from './recovery';
 import { WORKFLOWS } from './domain';
 import { redactText, redactValue } from './redactor';
+import { createKeysRouter } from './routes/keys';
+import { KeyService } from './services/key-service';
 
 interface AppDependencies {
   projectRoot: string;
@@ -22,6 +24,7 @@ interface AppDependencies {
   lockReader: (runtimeDirectory?: string) => { status: 'free' | 'busy' | 'stale' };
   lockGuardAcquirer: (runtimeDirectory: string) => () => void;
   automationAdmissionGuard: (runtimeDirectory: string) => void;
+  keyService?: KeyService;
 }
 
 const SecretFieldSchema = z.enum(['hotmailPassword', 'elevenPassword', 'apiKey']);
@@ -117,6 +120,9 @@ export function createApp(dependencies: AppDependencies) {
     }
     next();
   });
+
+  const keyService = dependencies.keyService ?? new KeyService(dependencies.projectRoot, configStore);
+  app.use('/api/keys', createKeysRouter(keyService));
 
   app.get('/api/health', async (_request, response) => {
     const active = jobManager.active();

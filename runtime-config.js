@@ -3,6 +3,7 @@ const path = require('path');
 
 const SECRET_SETTING_KEYS = [
   'proxyApiKey',
+  'proxyXoayKey',
   'capsolverApiKey',
   'capbypassApiKey',
   'twoCaptchaApiKey',
@@ -18,6 +19,7 @@ const ENV_MAP = {
   runtimeDirectory: 'MAIL_TEMP_RUNTIME_DIR',
   proxyProvider: 'MAIL_TEMP_PROXY_PROVIDER',
   proxyApiKey: 'MAIL_TEMP_PROXY_API_KEY',
+  proxyXoayKey: 'PROXY_XOAY_KEY',
   capsolverApiKey: 'CAPSOLVER_API_KEY',
   capbypassApiKey: 'CAPBYPASS_API_KEY',
   twoCaptchaApiKey: 'TWO_CAPTCHA_API_KEY',
@@ -55,7 +57,7 @@ function resolveRuntimeConfig({ projectRoot = __dirname, env = process.env, loca
     throw new Error('defaultIntervalMinutes must be a positive number');
   }
   merged.proxyProvider = String(merged.proxyProvider || 'none').trim().toLowerCase() || 'none';
-  if (!['none', 'sp07', 'tinproxy'].includes(merged.proxyProvider)) {
+  if (!['none', 'sp07', 'tinproxy', 'proxyxoay', 'custom', '4g'].includes(merged.proxyProvider)) {
     throw new Error(`Unsupported proxyProvider: ${merged.proxyProvider}`);
   }
   return merged;
@@ -87,13 +89,18 @@ function loadRuntimeConfig({ projectRoot = __dirname, env = process.env, filePat
 }
 
 function resolveProxyConfig(config, { required = false } = {}) {
-  const provider = config.proxyProvider || 'none';
+  const provider = (config.proxyProvider || 'none').toLowerCase();
   if (provider === 'none') {
     if (required) throw new Error('No proxy provider configured in Settings');
     return { provider, apiKey: null };
   }
-  const apiKey = String(config.proxyApiKey || '').trim();
-  if (!apiKey) throw new Error(`Proxy provider ${provider} requires proxyApiKey in Settings`);
+  if (provider === 'custom' || provider === '4g') {
+    const proxyString = String(config.customProxy || '').trim();
+    if (!proxyString && required) throw new Error('customProxy is not configured in config.local.json');
+    return { provider, apiKey: null, proxyString };
+  }
+  const apiKey = String((provider === 'proxyxoay' ? (config.proxyXoayKey || config.proxyApiKey) : (config.proxyApiKey || config.proxyXoayKey)) || '').trim();
+  if (!apiKey) throw new Error(`Proxy provider ${provider} requires proxyApiKey or proxyXoayKey in Settings`);
   return { provider, apiKey };
 }
 

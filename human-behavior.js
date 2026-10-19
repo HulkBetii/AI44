@@ -334,6 +334,121 @@ function generateRealisticName() {
   return { firstName: fn, lastName: ln, fullName: `${fn} ${ln}` };
 }
 
+/**
+ * Mô phỏng di chuyển chuột tự nhiên qua các điểm ngẫu nhiên trên màn hình (Wandering Mouse).
+ */
+async function simulateNaturalMouseMovements(page, moves = 3) {
+  const size = page.viewportSize()
+    || await page.evaluate(() => ({ width: window.innerWidth || 1280, height: window.innerHeight || 800 }))
+      .catch(() => ({ width: 1280, height: 800 }));
+
+  for (let m = 0; m < moves; m++) {
+    const targetX = Math.floor(Math.random() * (size.width - 200)) + 100;
+    const targetY = Math.floor(Math.random() * (size.height - 200)) + 100;
+
+    const points = generateBezierCurve(lastMousePos.x, lastMousePos.y, targetX, targetY, randomGaussian(15, 25));
+    for (let i = 0; i < points.length; i++) {
+      const p = points[i];
+      await page.mouse.move(p.x + (Math.random() - 0.5) * 2, p.y + (Math.random() - 0.5) * 2);
+      await new Promise(r => setTimeout(r, randomGaussian(6, 16)));
+    }
+    lastMousePos = { x: targetX, y: targetY };
+    await new Promise(r => setTimeout(r, randomGaussian(200, 600)));
+  }
+}
+
+/**
+ * Khởi động và làm ấm phiên duyệt web (Pre-Signup Warm-up).
+ * Mô phỏng người dùng thật truy cập landing page, xem nội dung, di chuột và bấm nút đăng ký.
+ */
+async function warmUpLandingPage(page) {
+  console.log('[warmup] 🌐 Warming up session on ElevenLabs landing page...');
+  await page.goto('https://elevenlabs.io', { waitUntil: 'domcontentloaded', timeout: 30000 });
+  await think(1000, 2000);
+
+  // 1. Di chuyển chuột tự nhiên khám phá hero section
+  await simulateNaturalMouseMovements(page, 2);
+
+  // 2. Cuộn trang mượt mà đọc nội dung
+  console.log('[warmup] 📜 Reading features and scrolling...');
+  await smoothScroll(page);
+  await think(1200, 2200);
+
+  // 3. Hover vào các menu/link trên trang
+  try {
+    const navLinks = await page.locator('header a, nav a, header button').all();
+    if (navLinks.length > 0) {
+      const randomLink = navLinks[Math.floor(Math.random() * Math.min(navLinks.length, 4))];
+      if (await randomLink.isVisible()) {
+        const box = await randomLink.boundingBox();
+        if (box) {
+          await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2, { steps: 10 });
+          await new Promise(r => setTimeout(r, randomGaussian(400, 800)));
+        }
+      }
+    }
+  } catch {}
+
+  // 4. Tìm và bấm nút "Sign up" / "Get started" hoặc chuyển hướng tự nhiên
+  console.log('[warmup] 🖱️ Finding and clicking Sign Up CTA...');
+  const signupSelectors = [
+    'a[href*="sign-up"]',
+    'a:has-text("Sign up")',
+    'button:has-text("Sign up")',
+    'a:has-text("Get started")',
+    'button:has-text("Get started free")',
+  ];
+
+  let clicked = false;
+  for (const sel of signupSelectors) {
+    try {
+      const el = page.locator(sel).first();
+      if (await el.isVisible()) {
+        await clickHuman(page, el);
+        clicked = true;
+        break;
+      }
+    } catch {}
+  }
+
+  if (!clicked) {
+    console.log('[warmup] Navigating directly to sign-up...');
+    await page.goto('https://elevenlabs.io/app/sign-up', { waitUntil: 'domcontentloaded' });
+  }
+
+  // Đợi trang sign-up tải xong
+  await page.waitForSelector('[data-testid="sign-up-email-input"]', { state: 'visible', timeout: 25000 });
+  await think(800, 1500);
+  await simulateNaturalMouseMovements(page, 1);
+  console.log('[warmup] ✅ Pre-signup warm-up completed.');
+}
+
+/**
+ * Làm ấm phiên duyệt web sau khi đăng nhập (Post-Login Dashboard Warm-up).
+ * Gửi telemetry DOM tự nhiên (scroll, hover, mouse movement) vào ElevenLabs.
+ */
+async function warmUpDashboard(page) {
+  console.log('[warmup] 🎙️ Warming up dashboard session...');
+  try {
+    await simulateNaturalMouseMovements(page, 2);
+    await smoothScroll(page);
+    await think(800, 1600);
+
+    // Di chuyển chuột qua khu vực văn bản / chọn giọng nói
+    const editor = page.locator('textarea, [contenteditable="true"]').first();
+    if (await editor.isVisible()) {
+      const box = await editor.boundingBox();
+      if (box) {
+        await page.mouse.move(box.x + box.width / 3, box.y + box.height / 2, { steps: 12 });
+        await new Promise(r => setTimeout(r, randomGaussian(300, 600)));
+      }
+    }
+    console.log('[warmup] ✅ Dashboard session warm-up completed.');
+  } catch (err) {
+    console.warn(`[warmup] Dashboard warm-up note: ${err.message}`);
+  }
+}
+
 module.exports = {
   randomGaussian,
   think,
@@ -341,5 +456,9 @@ module.exports = {
   clickHuman,
   typeHuman,
   smoothScroll,
-  generateRealisticName
+  generateRealisticName,
+  simulateNaturalMouseMovements,
+  warmUpLandingPage,
+  warmUpDashboard,
 };
+

@@ -1,4 +1,4 @@
-﻿/**
+/**
  * index.js (catch-all-signup)
  * High-Throughput Entry point and Multi-Worker execution loop for Catch-All ElevenLabs registration.
  */
@@ -10,6 +10,7 @@ const fs = require('fs');
 const gpm = require('../gpm-api');
 const { withAutomationLock } = require('../automation-lock');
 const { getNewProxyWithRetry, getNewTinProxyWithRetry } = require('../proxy');
+const { getNewProxyXoayWithRetry, getUniqueProxyXoayForAccount } = require('../proxyxoay-client');
 const { poissonIntervalDelay } = require('../human-behavior');
 const { loadRuntimeConfig, resolveProxyConfig } = require('../runtime-config');
 
@@ -82,6 +83,8 @@ function parseArgs(argv) {
   let resetFailed = false;
   let interval = 1;
   let concurrency = 1;
+  let proxyProviderOverride = null;
+  let customProxy = null;
 
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
@@ -93,6 +96,9 @@ function parseArgs(argv) {
     if (arg.startsWith('--generate=')) generate = parseInt(arg.split('=')[1], 10) || 0;
     if (arg === '--dry-run') dryRun = true;
     if (arg === '--no-proxy') noProxy = true;
+    if (arg === '--4g') proxyProviderOverride = '4g';
+    if (arg.startsWith('--custom-proxy=')) customProxy = arg.split('=')[1].trim();
+    if (arg.startsWith('--proxy=')) proxyProviderOverride = arg.split('=')[1].trim().toLowerCase();
     if (arg === '--reset-failed') resetFailed = true;
     if (arg.startsWith('--interval=')) interval = parseFloat(arg.split('=')[1]) || 1;
     if (arg.startsWith('--concurrency=')) concurrency = Math.max(1, parseInt(arg.split('=')[1], 10) || 1);
@@ -100,7 +106,7 @@ function parseArgs(argv) {
     if (arg.startsWith('-c=')) concurrency = Math.max(1, parseInt(arg.split('=')[1], 10) || 1);
   }
 
-  return { limit, row, generate, dryRun, noProxy, resetFailed, interval, concurrency };
+  return { limit, row, generate, dryRun, noProxy, resetFailed, interval, concurrency, proxyProviderOverride, customProxy };
 }
 
 async function cleanupWorkerSession(workerId) {
@@ -168,8 +174,15 @@ async function runWorker(workerId, queue, totalTasks, proxyConfig, options) {
           console.log(`${prefix} [proxy] Acquiring SP07 Proxy...`);
           const p = await getNewProxyWithRetry(proxyConfig.apiKey);
           proxyString = p.proxy;
+        } else if (proxyConfig.provider === 'proxyxoay') {
+          console.log(`${prefix} [proxy] Acquiring dedicated unique IP from ProxyXoay...`);
+          const p = await getUniqueProxyXoayForAccount(proxyConfig.apiKey);
+          proxyString = p.proxy;
+        } else if (proxyConfig.provider === 'custom' || proxyConfig.provider === '4g') {
+          proxyString = options.customProxy || proxyConfig.proxyString || '';
+          console.log(`${prefix} [proxy] 📱 Using 4G Mobile Proxy (Vinaphone): ${proxyString}`);
         }
-        console.log(`${prefix} [proxy] Proxy acquired successfully.`);
+        console.log(`${prefix} [proxy] Proxy acquired successfully: ${proxyString}`);
       } catch (proxyErr) {
         console.error(`${prefix} [proxy] ❌ Failed to rotate proxy: ${proxyErr.message}`);
         continue;
@@ -202,6 +215,14 @@ async function runWorker(workerId, queue, totalTasks, proxyConfig, options) {
       const result = await registerAccount(ctx, account, proxyString);
       if (result && result.apiKey) {
         appendSuccessRecord(account.email, account.password, result.apiKey, proxyString);
+        if (result.ttsResult) {
+          const tts = result.ttsResult;
+          if (tts.success) {
+            console.log(`${prefix} [tts] ✅ Verified TTS API: generated ${tts.audioSizeBytes} bytes audio.`);
+          } else {
+            console.log(`${prefix} [tts] ⚠️ TTS API status ${tts.status}: ${tts.message}`);
+          }
+        }
       }
     } catch (err) {
       console.error(`${prefix} ❌ FAILED [${account.email}]: ${err.message}`);
@@ -222,11 +243,21 @@ async function runWorker(workerId, queue, totalTasks, proxyConfig, options) {
 
 async function run(argv = process.argv.slice(2)) {
   cancellationRequested = false;
-  const { limit, row, generate, dryRun, noProxy, resetFailed, interval, concurrency } = parseArgs(argv);
+  const { limit, row, generate, dryRun, noProxy, resetFailed, interval, concurrency, proxyProviderOverride, customProxy } = parseArgs(argv);
 
   const catchAllConfig = loadCatchAllConfig();
   const runtimeConfig = loadRuntimeConfig();
-  const proxyConfig = noProxy ? { provider: 'none', apiKey: null } : resolveProxyConfig(runtimeConfig);
+  let proxyConfig;
+  if (noProxy) {
+    proxyConfig = { provider: 'none', apiKey: null };
+  } else if (proxyProviderOverride) {
+    const apiKey = proxyProviderOverride === 'proxyxoay'
+      ? (runtimeConfig.proxyXoayKey || runtimeConfig.proxyApiKey)
+      : runtimeConfig.proxyApiKey;
+    proxyConfig = { provider: proxyProviderOverride, apiKey };
+  } else {
+    proxyConfig = resolveProxyConfig(runtimeConfig);
+  }
 
   console.log('============================================================');
   console.log('🚀 CATCH-ALL ELEVENLABS AUTOMATION PIPELINE (HIGH-THROUGHPUT)');
@@ -293,7 +324,7 @@ async function run(argv = process.argv.slice(2)) {
   const workerPromises = [];
 
   for (let workerId = 1; workerId <= actualConcurrency; workerId++) {
-    workerPromises.push(runWorker(workerId, queue, totalTasks, proxyConfig, { interval }));
+    workerPromises.push(runWorker(workerId, queue, totalTasks, proxyConfig, { interval, customProxy }));
   }
 
   await Promise.all(workerPromises);

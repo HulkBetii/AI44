@@ -310,7 +310,11 @@ async function createProfile(name, proxy = '') {
   // Persist intent before the remote mutation. If this process exits while /create is in
   // flight, the next run must reconcile instead of assuming no profile was created.
   const evidence = recordUncertainCreate(name, beforeIds);
-  const endpoint = `/v2/create?name=${encodeURIComponent(name)}${proxyParam}&canvas=off&font=off&webrtc=on`;
+  // Configure high-reputation anti-detect fingerprint:
+  // - canvas=noise, audio=noise, webgl=noise: unique subtle hardware noise per profile
+  // - webrtc=alter: masks real IP with proxy IP (eliminates WebRTC leak detection)
+  // - timezone=1, geolocation=1: matches timezone and geo coordinates to proxy IP
+  const endpoint = `/v2/create?name=${encodeURIComponent(name)}${proxyParam}&canvas=noise&audio=noise&webgl=noise&webrtc=alter&timezone=1&geolocation=1`;
   try {
     const res = await callApi(endpoint);
     if (res?.profile_id) {

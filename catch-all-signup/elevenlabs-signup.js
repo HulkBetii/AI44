@@ -12,17 +12,17 @@ const {
   think,
   smoothScroll,
   generateRealisticName,
+  warmUpLandingPage,
+  warmUpDashboard,
 } = require('../human-behavior');
 const { waitForElevenLabsVerifyEmail } = require('./imap-client');
 const { updateAccountStatus, updateAccountResult } = require('./sheets');
 const { collectSecretValues, collectUrlSecrets, redactSecrets } = require('../secret-sanitizer');
+const { testElevenLabsTts } = require('./tts-tester');
 
 const SIGN_IN_EMAIL_SELECTOR = '[data-testid="sign-in-email-input"]';
 const SIGN_IN_PASSWORD_SELECTOR = '[data-testid="sign-in-password-input"]';
 const SIGN_IN_SUBMIT_SELECTOR = 'button[style*="view-transition-name: submit"]';
-const SURVEY_OPTION_SELECTOR = '[data-agent-id^="onboarding-icon-option-"], [data-agent-id^="onboarding-illustration-option-"]';
-const ONBOARDING_TIMEOUT_MS = 120000;
-const STEP_RENDER_TIMEOUT_MS = 20000;
 
 const SIGN_IN = {
   OK: 'ok',
@@ -123,161 +123,78 @@ async function attemptSignIn(page, email, password) {
 }
 
 /**
- * Grant all permissions in API key dialog
+ * Create a Token Sniffer that listens to all outgoing requests in a browser context.
+ * Resolves as soon as any request contains an Authorization Bearer header for ElevenLabs.
  */
-async function grantAllPermissions(page) {
-  const dialog = page.getByRole('dialog');
-  const restrictToggle = dialog.getByRole('switch').first();
-  if (await restrictToggle.count() === 0) {
-    throw new Error('Restrict Key toggle not found in dialog');
-  }
-  if (await restrictToggle.getAttribute('aria-checked') !== 'true') {
-    await clickHuman(page, restrictToggle);
-    await page.waitForTimeout(400);
-  }
+function createTokenSniffer(ctx) {
+  let capturedToken = null;
+  const listeners = [];
 
-  const groups = dialog.locator('[role="tablist"]');
-  const total = await groups.count();
-  if (total === 0) throw new Error('No endpoint permission groups found in dialog');
+  const requestListener = (req) => {
+    try {
+      const url = req.url();
+      if (!url.includes('elevenlabs.io')) return;
 
-  for (let i = 0; i < total; i++) {
-    const group = groups.nth(i);
-    const write = group.locator('button[id$="-trigger-write"]');
-    const target = (await write.count()) > 0
-      ? write.first()
-      : group.locator('button[id$="-trigger-access"]').first();
-
-    if (await target.count() === 0) continue;
-    if (await target.getAttribute('aria-selected') !== 'true') {
-      await clickHuman(page, target);
-      await page.waitForTimeout(80);
+      const headers = req.headers ? req.headers() : {};
+      const auth = headers['authorization'] || headers['Authorization'];
+      if (auth && typeof auth === 'string') {
+        const clean = auth.replace(/^Bearer\s+/i, '').trim();
+        // Valid ElevenLabs Bearer token is non-empty and reasonably long (>20 chars)
+        if (clean.length > 20) {
+          capturedToken = clean;
+          console.log(`[token] ✅ Captured Bearer token (${clean.slice(0, 10)}...${clean.slice(-6)}) from ${url.split('?')[0]}`);
+          while (listeners.length > 0) {
+            listeners.shift()(clean);
+          }
+        }
+      }
+    } catch {
+      // Ignore transient errors if context/page closes
     }
-  }
+  };
+
+  ctx.on('request', requestListener);
+
+  return {
+    getToken: () => capturedToken,
+    waitForToken: (timeoutMs = 45000) => {
+      if (capturedToken) return Promise.resolve(capturedToken);
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+          const idx = listeners.indexOf(onToken);
+          if (idx !== -1) listeners.splice(idx, 1);
+          reject(new Error(`Timed out waiting for ElevenLabs Bearer token after ${Math.round(timeoutMs / 1000)}s`));
+        }, timeoutMs);
+
+        const onToken = (token) => {
+          clearTimeout(timer);
+          resolve(token);
+        };
+        listeners.push(onToken);
+      });
+    },
+    cleanup: () => {
+      try { ctx.off('request', requestListener); } catch {}
+    },
+  };
 }
 
 /**
- * Finish onboarding steps and create API key
+ * Robustly acquire the Bearer token: return if already sniffed, or wait and trigger speech-synthesis if needed.
  */
-async function finishOnboardingAndKey(page, account, password) {
-  console.log('[onboarding] Navigating onboarding steps...');
-  const { firstName } = generateRealisticName();
-  const ADVANCE_BUTTONS = ['Continue', 'Next', 'Skip', 'Get started', 'Got it'];
-  const onboardingDeadline = Date.now() + ONBOARDING_TIMEOUT_MS;
+async function acquireToken(sniffer, page, timeoutMs = 30000) {
+  const token = sniffer.getToken();
+  if (token) return token;
 
-  while (page.url().includes('/app/onboarding')) {
-    if (Date.now() > onboardingDeadline) {
-      throw new Error(`Onboarding did not finish within ${ONBOARDING_TIMEOUT_MS}ms.`);
+  try {
+    return await sniffer.waitForToken(8000);
+  } catch {
+    if (page && !page.isClosed()) {
+      console.log('[token] Triggering authenticated requests via speech-synthesis...');
+      await page.goto('https://elevenlabs.io/app/speech-synthesis', { waitUntil: 'domcontentloaded' }).catch(() => {});
     }
-
-    await page.waitForFunction(() => document.body.innerText.trim().length > 0, {
-      timeout: STEP_RENDER_TIMEOUT_MS,
-    }).catch(() => {});
-
-    await think(1200, 2500);
-
-    // Randomized survey option click
-    if (Math.random() < 0.7) {
-      const surveyOptions = page.locator(SURVEY_OPTION_SELECTOR);
-      const optCount = await surveyOptions.count().catch(() => 0);
-      if (optCount > 0) {
-        const randIdx = Math.floor(Math.random() * optCount);
-        const opt = surveyOptions.nth(randIdx);
-        if (await opt.isVisible().catch(() => false)) {
-          await clickHuman(page, opt).catch(() => {});
-          await think(500, 1200);
-        }
-      }
-    }
-
-    // Age / Name form if present
-    if (await page.$('#firstname')) {
-      await typeHuman(page, '#firstname', firstName);
-      await page.waitForTimeout(500);
-      const ageCheckbox = await page.$('button[role="checkbox"]')
-        || await page.$('.checkbox-hitarea')
-        || await page.$('input[type="checkbox"][name*="adult"]');
-      if (ageCheckbox && await ageCheckbox.getAttribute('aria-checked') !== 'true') {
-        await clickHuman(page, ageCheckbox);
-        await page.waitForTimeout(400);
-      }
-    }
-
-    let advanced = false;
-    for (const label of ADVANCE_BUTTONS) {
-      const byRole = page.getByRole('button', { name: label, exact: true });
-      const byText = page.getByText(label, { exact: true });
-      let control = null;
-      for (const candidate of [byRole, byText]) {
-        const first = candidate.first();
-        if (await first.count().catch(() => 0) === 0) continue;
-        if (!await first.isVisible().catch(() => false)) continue;
-        control = first;
-        break;
-      }
-      if (!control) continue;
-
-      await clickHuman(page, control).catch(() => {});
-      await page.waitForTimeout(1500);
-      advanced = true;
-      break;
-    }
-
-    if (!advanced) await page.waitForTimeout(1000);
+    return await sniffer.waitForToken(timeoutMs);
   }
-
-  // Welcome banners
-  await page.waitForSelector('button:has-text("Got it")', { timeout: 3000 })
-    .then(() => clickHuman(page, 'button:has-text("Got it")'))
-    .catch(() => {});
-
-  // Create API Key
-  console.log('[apikey] Navigating to API keys page...');
-  await page.goto('https://elevenlabs.io/app/developers/api-keys', { waitUntil: 'domcontentloaded' });
-  await page.waitForTimeout(2000);
-
-  await page.waitForSelector('button:has-text("Got it")', { timeout: 4000 })
-    .then(() => page.click('button:has-text("Got it")'))
-    .catch(() => {});
-  await page.waitForTimeout(400);
-  await page.keyboard.press('Escape');
-
-  await page.waitForSelector('button:has-text("Create Key")', { timeout: 15000 });
-  await clickHuman(page, 'button:has-text("Create Key")');
-  await page.waitForTimeout(1000);
-
-  const keyName = 'Key-' + Math.random().toString(36).slice(2, 8).toUpperCase();
-  await page.waitForSelector('input[placeholder="API Key Name"]', { timeout: 10000 });
-  await page.fill('input[placeholder="API Key Name"]', keyName);
-  await page.waitForTimeout(500);
-
-  await grantAllPermissions(page);
-
-  await page.getByRole('dialog').getByRole('button', { name: 'Create Key', exact: true }).last().click({ timeout: 10000 });
-  await page.waitForTimeout(1000);
-
-  // Confirm dialog if shown
-  const confirmCreate = page.locator('button[data-agent-protected="true"]', { hasText: 'Create Key' });
-  if (await confirmCreate.count() > 0) {
-    await clickHuman(page, confirmCreate.last());
-    await page.waitForTimeout(1500);
-  }
-
-  const keyDialog = page.getByRole('dialog');
-  await page.getByRole('button', { name: 'Copy to Clipboard', exact: true }).click({ timeout: 15000 });
-  await page.waitForTimeout(500);
-
-  let apiKey = await keyDialog.locator('input[readonly]').first().inputValue().catch(() => '');
-  if (!apiKey) {
-    await page.bringToFront();
-    apiKey = await page.evaluate(() => navigator.clipboard.readText()).catch(() => '');
-  }
-
-  if (!apiKey || !apiKey.startsWith('sk_')) {
-    throw new Error('API key was not captured in expected format (sk_...)');
-  }
-
-  console.log(`[apikey] ✅ API Key captured: ${apiKey.slice(0, 7)}...`);
-  return apiKey;
 }
 
 /**
@@ -294,22 +211,17 @@ async function registerAccount(ctx, account, proxyString = '') {
 
   let currentStep = 'init';
   let activePage = null;
+  const sniffer = createTokenSniffer(ctx);
 
   try {
-    // 1. Open ElevenLabs sign-up page
+    // 1. Warm-up session on landing page and navigate to sign-up
     currentStep = 'navigate-signup';
     await updateAccountStatus(rowIndex, 'processing');
     const page = await ctx.newPage();
     activePage = page;
 
-    await page.goto('https://elevenlabs.io', { waitUntil: 'domcontentloaded' });
-    await page.evaluate(() => { localStorage.clear(); sessionStorage.clear(); }).catch(() => {});
-
-    await page.goto('https://elevenlabs.io/app/sign-up', { waitUntil: 'domcontentloaded' });
-    await page.waitForSelector('[data-testid="sign-up-email-input"]', { state: 'visible', timeout: 25000 });
-
-    await think(1500, 3000);
-    await smoothScroll(page);
+    // Organic warm-up: visits landing page, scrolls, wanders mouse, clicks Sign Up CTA
+    await warmUpLandingPage(page);
 
     // 2. Type credentials
     currentStep = 'fill-signup-form';
@@ -330,7 +242,7 @@ async function registerAccount(ctx, account, proxyString = '') {
     const checkAccountExists = async () => {
       return await page.evaluate(() => {
         const body = document.body ? document.body.innerText : '';
-        return /already exists|already registered|already in use|Sign in or reset your password/i.test(body);
+        return /account already exists|Sign in or reset your password|email is already in use/i.test(body);
       }).catch(() => false);
     };
 
@@ -398,9 +310,11 @@ async function registerAccount(ctx, account, proxyString = '') {
       const outcome = await attemptSignIn(signinPage, email, password);
 
       if (outcome === SIGN_IN.OK) {
-        const apiKey = await finishOnboardingAndKey(signinPage, account, password);
+        currentStep = 'capture-token';
+        console.log(`[token] Intercepting Bearer token for ${email}...`);
+        const apiKey = await acquireToken(sniffer, signinPage);
         await updateAccountResult(rowIndex, { apiKey, elevenPass: password, status: 'complete' });
-        console.log(`\n🎉 RECOVERED & COMPLETED [${email}]: API Key = ${apiKey}`);
+        console.log(`\n🎉 RECOVERED & COMPLETED [${email}]: Bearer Token = ${apiKey.slice(0, 10)}...`);
         return { success: true, apiKey };
       }
 
@@ -419,9 +333,11 @@ async function registerAccount(ctx, account, proxyString = '') {
 
         const outcomeAfterVerify = await attemptSignIn(vPage, email, password);
         if (outcomeAfterVerify === SIGN_IN.OK) {
-          const apiKey = await finishOnboardingAndKey(vPage, account, password);
+          currentStep = 'capture-token';
+          console.log(`[token] Intercepting Bearer token for ${email}...`);
+          const apiKey = await acquireToken(sniffer, vPage);
           await updateAccountResult(rowIndex, { apiKey, elevenPass: password, status: 'complete' });
-          console.log(`\n🎉 RECOVERED & COMPLETED [${email}]: API Key = ${apiKey}`);
+          console.log(`\n🎉 RECOVERED & COMPLETED [${email}]: Bearer Token = ${apiKey.slice(0, 10)}...`);
           return { success: true, apiKey };
         }
       }
@@ -458,10 +374,29 @@ async function registerAccount(ctx, account, proxyString = '') {
 
           const postResetOutcome = await attemptSignIn(resetPage, email, password);
           if (postResetOutcome === SIGN_IN.OK) {
-            const apiKey = await finishOnboardingAndKey(resetPage, account, password);
+            currentStep = 'capture-token';
+            console.log(`[token] Intercepting Bearer token for ${email}...`);
+            const apiKey = await acquireToken(sniffer, resetPage);
+
+            // Test call API TTS immediately after acquiring key
+            console.log(`[tts-test] 🎙️ Testing live Text-to-Speech (TTS) call with acquired key...`);
+            let ttsResult = null;
+            try {
+              ttsResult = await testElevenLabsTts(apiKey);
+              if (ttsResult.success) {
+                console.log(`[tts-test] ✅ TTS API test SUCCEEDED! Generated ${ttsResult.audioSizeBytes} bytes audio.`);
+              } else if (ttsResult.detectedUnusualActivity) {
+                console.warn(`[tts-test] ⚠️ TTS API test: detected_unusual_activity (Free tier generation restricted).`);
+              } else {
+                console.warn(`[tts-test] ⚠️ TTS API test: HTTP ${ttsResult.status} - ${ttsResult.message}`);
+              }
+            } catch (ttsErr) {
+              console.warn(`[tts-test] ⚠️ TTS API test error: ${ttsErr.message}`);
+            }
+
             await updateAccountResult(rowIndex, { apiKey, elevenPass: password, status: 'complete' });
-            console.log(`\n🎉 PASSWORD RESET & COMPLETED [${email}]: API Key = ${apiKey}`);
-            return { success: true, apiKey };
+            console.log(`\n🎉 PASSWORD RESET & COMPLETED [${email}]: Bearer Token = ${apiKey.slice(0, 10)}...`);
+            return { success: true, apiKey, ttsResult };
           }
         } catch (resetErr) {
           console.warn(`[recovery] Password reset attempt failed: ${resetErr.message}`);
@@ -498,24 +433,44 @@ async function registerAccount(ctx, account, proxyString = '') {
     await clickHuman(verifyPage, 'button:has-text("Continue")');
     await verifyPage.waitForTimeout(2000);
 
-    // 7. Sign in, complete onboarding, and extract API Key
-    currentStep = 'signin-and-create-key';
+    // 7. Sign in and intercept Bearer Token
+    currentStep = 'capture-token';
     const outcome = await attemptSignIn(verifyPage, email, password);
     if (outcome !== SIGN_IN.OK) {
       throw new Error(`Sign-in after verify did not complete (${outcome})`);
     }
 
-    const apiKey = await finishOnboardingAndKey(verifyPage, account, password);
+    console.log(`[token] Intercepting Bearer token for ${email}...`);
+    const apiKey = await acquireToken(sniffer, verifyPage);
 
-    // 8. Update Google Sheet with complete status and API Key
+    // 8. Human warm-up on dashboard to establish legitimate session telemetry
+    await warmUpDashboard(verifyPage);
+
+    // 9. Test call API TTS immediately after acquiring key
+    console.log(`[tts-test] 🎙️ Testing live Text-to-Speech (TTS) call with acquired key...`);
+    let ttsResult = null;
+    try {
+      ttsResult = await testElevenLabsTts(apiKey);
+      if (ttsResult.success) {
+        console.log(`[tts-test] ✅ TTS API test SUCCEEDED! Generated ${ttsResult.audioSizeBytes} bytes audio.`);
+      } else if (ttsResult.detectedUnusualActivity) {
+        console.warn(`[tts-test] ⚠️ TTS API test: detected_unusual_activity (Free tier generation restricted).`);
+      } else {
+        console.warn(`[tts-test] ⚠️ TTS API test: HTTP ${ttsResult.status} - ${ttsResult.message}`);
+      }
+    } catch (ttsErr) {
+      console.warn(`[tts-test] ⚠️ TTS API test error: ${ttsErr.message}`);
+    }
+
+    // 9. Update Google Sheet with complete status and Bearer Token
     await updateAccountResult(rowIndex, {
       apiKey,
       elevenPass: password,
       status: 'complete',
     });
 
-    console.log(`\n🎉 SUCCESS [${email}]: API Key = ${apiKey}`);
-    return { success: true, apiKey };
+    console.log(`\n🎉 SUCCESS [${email}]: Bearer Token = ${apiKey.slice(0, 10)}...`);
+    return { success: true, apiKey, ttsResult };
   } catch (err) {
     console.error(`\n❌ FAILED [${email}] at step '${currentStep}': ${safeErrorText(err, [password])}`);
 
@@ -537,13 +492,15 @@ async function registerAccount(ctx, account, proxyString = '') {
     }
 
     throw err;
+  } finally {
+    sniffer.cleanup();
   }
 }
 
 module.exports = {
   SIGN_IN,
   attemptSignIn,
-  grantAllPermissions,
-  finishOnboardingAndKey,
+  createTokenSniffer,
   registerAccount,
+  testElevenLabsTts,
 };

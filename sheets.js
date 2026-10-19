@@ -197,6 +197,62 @@ async function appendRows(values) {
   return res.data;
 }
 
+async function ensureMuseSheet() {
+  const meta = await client().spreadsheets.get({ spreadsheetId: activeSheetId });
+  const sheetExists = meta.data.sheets.some((s) => s.properties.title === 'muse');
+  if (!sheetExists) {
+    await client().spreadsheets.batchUpdate({
+      spreadsheetId: activeSheetId,
+      requestBody: {
+        requests: [
+          {
+            addSheet: {
+              properties: {
+                title: 'muse',
+                gridProperties: { rowCount: 1000, columnCount: 10 },
+              },
+            },
+          },
+        ],
+      },
+    });
+    console.log('[sheet] Đã tạo sheet mới "muse".');
+  }
+
+  const headerRes = await client().spreadsheets.values.get({
+    spreadsheetId: activeSheetId,
+    range: 'muse!A1:H1',
+  }).catch(() => null);
+
+  const headerValues = headerRes?.data?.values;
+  if (!headerValues || headerValues.length === 0 || !headerValues[0] || headerValues[0].length === 0) {
+    await client().spreadsheets.values.update({
+      spreadsheetId: activeSheetId,
+      range: 'muse!A1:H1',
+      valueInputOption: 'RAW',
+      requestBody: {
+        values: [['Timestamp', 'Email', 'Password', 'ReferralCode', 'Proxy', 'Status', 'Tokens', 'Notes']],
+      },
+    });
+    console.log('[sheet] Đã khởi tạo tiêu đề cột cho sheet "muse".');
+  }
+}
+
+async function appendMuseRow({ email, password, referralCode, proxy, status, tokens = '', notes = '' }) {
+  await ensureMuseSheet();
+  const timestamp = new Date().toLocaleString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh' });
+  const row = [timestamp, email, password, referralCode || '', proxy || '', status, tokens, notes];
+  const res = await client().spreadsheets.values.append({
+    spreadsheetId: activeSheetId,
+    range: 'muse!A:H',
+    valueInputOption: 'USER_ENTERED',
+    insertDataOption: 'INSERT_ROWS',
+    requestBody: { values: [row] },
+  });
+  console.log(`[sheet] Đã ghi nhận tài khoản vào sheet "muse": ${email} [${status}]`);
+  return res.data;
+}
+
 module.exports = {
   SHEET_ID, SHEET_NAME, COL, SHEET_IDENTITY_UNSAFE,
   configureSheets,
@@ -205,4 +261,5 @@ module.exports = {
   resolveUniqueRowByEmail, resolveUniqueRowsByEmail,
   updateStatusByEmail, updatePasswordByEmail, updatePasswordAndStatusByEmail, updateResultByEmail,
   appendRows,
+  ensureMuseSheet, appendMuseRow,
 };

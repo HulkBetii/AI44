@@ -1,6 +1,6 @@
 {
   "name": "mail-temp",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "Local operator console for the Hotmail to ElevenLabs automation pipeline",
   "main": "signup-hotmail.js",
   "scripts": {
@@ -19,8 +19,11 @@
     "batch": "node batch.js",
     "signup:catchall": "node catch-all-signup/index.js",
     "generate:catchall": "node catch-all-signup/email-generator.js",
+    "export:catchall": "node catch-all-signup/export-keys.js --sep=\" , \"",
+    "export:new": "node catch-all-signup/export-keys.js --last=5 --out=new-5-keys.txt --format=lines",
     "trial:gpt": "node trial-gpt/index.js",
-    "reg:gmail": "node reg-gmail/index.js"
+    "reg:gmail": "node reg-gmail/index.js",
+    "reg:museai": "node reg-museai/index.js"
   },
   "keywords": [],
   "author": "",

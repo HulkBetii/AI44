@@ -580,10 +580,13 @@ async function loginMicrosoft(ctx, hotmailEmail, hotmailPassword) {
       const signInLink = loginPage.locator('a[data-bi-name="SignIn"], a:has-text("Đăng nhập"), a:has-text("Sign in")').first();
       if (await signInLink.isVisible({ timeout: 3000 }).catch(() => false)) {
         await signInLink.click().catch(() => {});
-        await loginPage.waitForTimeout(4000);
-      } else {
+        await loginPage.waitForURL((url) => url.toString().includes('outlook.live.com'), { timeout: 25000 }).catch(() => {});
+        await loginPage.waitForTimeout(2000);
+      }
+      if (!loginPage.url().includes('outlook.live.com')) {
         await loginPage.goto('https://outlook.live.com/mail/0/', { waitUntil: 'domcontentloaded', timeout: 25000 }).catch(() => {});
-        await loginPage.waitForTimeout(3000);
+        await loginPage.waitForURL((url) => url.toString().includes('outlook.live.com'), { timeout: 15000 }).catch(() => {});
+        await loginPage.waitForTimeout(2000);
       }
 
       if (loginPage.url().includes('outlook.live.com')) {

@@ -7,7 +7,16 @@ catch-all-keys.txt
 service-account.json
 hotmail.csv
 success_accounts.csv
+*.csv
 keys.txt
+new-5-keys.txt
+new-keys*.txt
+new-key.txt
+*key*.txt
+check_live_results.json
+*.exe
+*.crx
+extensions/
 config.local.json
 .runtime/
 dist/

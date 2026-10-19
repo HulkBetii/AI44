@@ -253,3 +253,85 @@ export interface RecoveryEntrySummary {
 export interface RecoveryResponse {
   entries: RecoveryEntrySummary[];
 }
+
+// -------------------------------------------------------------
+// Backend Key Management Contracts (/api/keys)
+// -------------------------------------------------------------
+
+export const CheckQuotaRequestSchema = z.object({
+  key: z.string().trim().min(1).optional(),
+  email: z.string().trim().min(1).optional(),
+  syncToSheet: z.boolean().optional(),
+}).refine((data) => Boolean(data.key || data.email), {
+  message: 'Either key or email must be provided',
+});
+
+export type CheckQuotaRequest = z.infer<typeof CheckQuotaRequestSchema>;
+
+export interface CheckQuotaResponse {
+  success: boolean;
+  valid: boolean;
+  tier?: string;
+  characterCount?: number;
+  characterLimit?: number;
+  remainingCharacters?: number;
+  status?: string;
+  resetAt?: number | null;
+  error?: string;
+  message?: string;
+  checkedAt: string;
+}
+
+export const ListKeysQuerySchema = z.object({
+  limit: z.coerce.number().int().positive().max(500).default(50),
+  offset: z.coerce.number().int().min(0).default(0),
+  status: z.enum(['complete', 'pending', 'failed', 'all']).default('complete'),
+  format: z.enum(['json', 'text']).default('json'),
+  with_quota: z.preprocess((val) => val === 'true' || val === true, z.boolean()).default(false),
+});
+
+export type ListKeysQuery = z.infer<typeof ListKeysQuerySchema>;
+
+export interface KeyItemSummary {
+  rowIndex: number;
+  email: string;
+  apiKey: string;
+  status: string;
+  createdAt: string;
+  quota?: {
+    valid: boolean;
+    remainingCharacters?: number;
+    characterLimit?: number;
+    tier?: string;
+  };
+}
+
+export interface ListKeysResponse {
+  success: boolean;
+  total: number;
+  count: number;
+  offset: number;
+  limit: number;
+  data: KeyItemSummary[];
+}
+
+export const RefreshKeyRequestSchema = z.object({
+  email: z.string().trim().min(1).optional(),
+  key: z.string().trim().min(1).optional(),
+  mode: z.enum(['auto', 'reauth', 'provision']).default('auto'),
+}).refine((data) => Boolean(data.email || data.key || data.mode === 'provision'), {
+  message: 'email or key is required unless mode is provision',
+});
+
+export type RefreshKeyRequest = z.infer<typeof RefreshKeyRequestSchema>;
+
+export interface RefreshKeyResponse {
+  success: boolean;
+  action: 'reauth' | 'provision_pool' | 'provision_created';
+  email: string;
+  apiKey: string;
+  status: string;
+  remainingCharacters?: number;
+  message?: string;
+}
+

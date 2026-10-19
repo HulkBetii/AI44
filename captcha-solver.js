@@ -44,6 +44,7 @@ const PROVIDERS = [
       'AntiTurnstileTaskProxyLess',
       'ReCaptchaV2TaskProxyLess',
       'ReCaptchaV3TaskProxyLess',
+      'ReCaptchaV2EnterpriseTaskProxyLess',
       'HCaptchaTaskProxyLess',
       'HCaptchaTask',
       'HCaptchaEnterpriseTask',
@@ -57,6 +58,7 @@ const PROVIDERS = [
       'AntiTurnstileTaskProxyLess',
       'ReCaptchaV2TaskProxyLess',
       'ReCaptchaV3TaskProxyLess',
+      'ReCaptchaV2EnterpriseTaskProxyLess',
       'FunCaptchaTaskProxyLess',
       'HCaptchaTaskProxyLess',
       'HCaptchaTask',
@@ -191,12 +193,22 @@ async function detectCaptcha(page) {
       return { type: 'AntiTurnstileTaskProxyLess', provider: 'turnstile', sitekey, url: location.href };
     }
 
-    // 3. reCAPTCHA v2
+    // 3. reCAPTCHA Enterprise
+    const enterpriseIframe = document.querySelector('iframe[src*="recaptcha/enterprise"]');
+    if (enterpriseIframe) {
+      const sitekey = enterpriseIframe.src.match(/[?&]k=([^&]+)/)?.[1]
+        || document.querySelector('[data-sitekey]')?.getAttribute('data-sitekey')
+        || '';
+      const s = enterpriseIframe.src.match(/[?&]s=([^&]+)/)?.[1] || '';
+      return { type: 'ReCaptchaV2EnterpriseTaskProxyLess', provider: 'recaptcha_enterprise', sitekey, s, url: location.href };
+    }
+
+    // 3b. reCAPTCHA v2
     const recaptchaDiv = document.querySelector('.g-recaptcha[data-sitekey]');
     const recaptchaIframe = document.querySelector('iframe[src*="recaptcha/api2"]');
     if (recaptchaDiv || recaptchaIframe) {
       const sitekey = recaptchaDiv?.getAttribute('data-sitekey')
-        || (recaptchaIframe?.src?.match(/k=([^&]+)/)?.[1])
+        || (recaptchaIframe?.src?.match(/[?&]k=([^&]+)/)?.[1])
         || '';
       return { type: 'ReCaptchaV2TaskProxyLess', provider: 'recaptcha_v2', sitekey, url: location.href };
     }
@@ -339,10 +351,12 @@ function buildTask(providerName, captchaInfo, proxyString) {
     }
     case 'AntiTurnstileTaskProxyLess':
     case 'ReCaptchaV2TaskProxyLess':
+    case 'ReCaptchaV2EnterpriseTaskProxyLess':
       return {
         type: captchaInfo.type,
         websiteURL: captchaInfo.url,
         websiteKey: captchaInfo.sitekey,
+        isInvisible: captchaInfo.isInvisible || false,
       };
     case 'ReCaptchaV3TaskProxyLess':
       return {
@@ -526,7 +540,7 @@ async function solveWithProvider(page, provider, captchaInfo, tag, proxyString, 
       try {
         const errorText = await page.evaluate(() => {
           const body = document.body ? document.body.innerText : '';
-          if (/already exists|already registered|already in use|Sign in or reset your password/i.test(body)) {
+          if (/account already exists|Sign in or reset your password|email is already in use/i.test(body)) {
             return 'ALREADY_REGISTERED';
           }
           return null;
@@ -849,7 +863,7 @@ async function injectToken(page, captchaInfo, token) {
       const cbName = widget?.getAttribute('data-callback');
       if (cbName && typeof window[cbName] === 'function') window[cbName](tkn);
     }, token);
-  } else if (captchaInfo.provider === 'recaptcha_v2' || captchaInfo.provider === 'recaptcha_v3') {
+  } else if (captchaInfo.provider === 'recaptcha_v2' || captchaInfo.provider === 'recaptcha_v3' || captchaInfo.provider === 'recaptcha_enterprise') {
     await page.evaluate((tkn) => {
       const textarea = document.querySelector('#g-recaptcha-response, [name="g-recaptcha-response"]');
       if (textarea) {
